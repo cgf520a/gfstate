@@ -1,6 +1,18 @@
 import React, { isValidElement } from 'react';
 import { useSyncExternalStore } from 'use-sync-external-store/shim';
 import MemoizedFnHelper from './MemoizedFnHelper';
+import { type EqualityFn, shallowEqual, deepEqual } from './equality';
+import {
+  type GfstatePlugin,
+  type PluginContext,
+  type OnBeforeSetResult,
+  registerGlobalPlugin,
+  getGlobalPlugins,
+  clearGlobalPlugins,
+  createBeforeSetRunner,
+  createAfterSetRunner,
+  createSubscribeRunner,
+} from './plugins';
 
 // 使用同步函数来初始化状态，同步函数直接就执行了再返回值，跟立即执行是一样的
 export const syncWrapper = <T = unknown>(fn: () => T) => {
@@ -37,6 +49,33 @@ export const IS_GFSTATE_STORE = Symbol('is_gfstate_store');
 
 // 外部订阅 API 标识符
 export const SUBSCRIBE = Symbol('gfstate_subscribe');
+
+// 内部方法标识符
+export const RESET = Symbol('gfstate_reset');
+export const DESTROY = Symbol('gfstate_destroy');
+export const SNAPSHOT = Symbol('gfstate_snapshot');
+
+// 重新导出相等性工具函数，方便用户使用
+export { shallowEqual, deepEqual };
+export type { EqualityFn };
+
+// 提取对象所有嵌套属性路径（点分隔字符串 如 'user.profile.name'）
+type NestedKeyPaths<T> = T extends Record<string, unknown>
+  ? {
+      [K in keyof T & string]: T[K] extends Record<string, unknown>
+        ? K | `${K}.${NestedKeyPaths<T[K]>}`
+        : K;
+    }[keyof T & string]
+  : never;
+
+// 根据点路径获取值类型
+type PathValue<T, P extends string> = P extends `${infer K}.${infer Rest}`
+  ? K extends keyof T
+    ? PathValue<NonNullable<T[K]>, Rest>
+    : unknown
+  : P extends keyof T
+  ? T[P]
+  : unknown;
 
 // symbol不能作为值, bigint当number处理，这些类型是可以===判断的基本类型
 type BaseType = string | number | boolean | undefined | null | bigint | symbol;
@@ -86,11 +125,60 @@ export type TransformData<
     : Data[K];
 };
 
-// 外部订阅函数类型
-type SubscribeFn = {
-  (cb: (key: string, newVal: unknown, oldVal: unknown) => void): () => void;
-  (key: string, cb: (newVal: unknown, oldVal: unknown) => void): () => void;
+// 深拷贝工具函数（用于 reset 初始快照和 snapshot）
+const deepClone = <T>(obj: T, seen = new WeakMap()): T => {
+  if (obj === null || typeof obj !== 'object') return obj;
+  if (obj instanceof Date) return new Date(obj.getTime()) as T;
+  if (obj instanceof RegExp) return new RegExp(obj.source, obj.flags) as T;
+  if (obj instanceof Map) {
+    const map = new Map();
+    (obj as Map<unknown, unknown>).forEach((v, k) =>
+      map.set(deepClone(k, seen), deepClone(v, seen)),
+    );
+    return map as T;
+  }
+  if (obj instanceof Set) {
+    const set = new Set();
+    (obj as Set<unknown>).forEach((v) => set.add(deepClone(v, seen)));
+    return set as T;
+  }
+  if (seen.has(obj as object)) return seen.get(obj as object);
+  if (Array.isArray(obj)) {
+    const arr: unknown[] = [];
+    seen.set(obj, arr);
+    obj.forEach((item, i) => (arr[i] = deepClone(item, seen)));
+    return arr as T;
+  }
+  const clone = Object.create(Object.getPrototypeOf(obj));
+  seen.set(obj as object, clone);
+  for (const key of Object.keys(obj as object)) {
+    clone[key] = deepClone((obj as any)[key], seen);
+  }
+  return clone;
 };
+
+// 外部订阅函数类型（支持嵌套路径类型推断）
+type SubscribeFn<
+  Data extends Record<string, unknown> = Record<string, unknown>,
+> = {
+  (cb: (key: string, newVal: unknown, oldVal: unknown) => void): () => void;
+  <P extends NestedKeyPaths<Data>>(
+    key: P,
+    cb: (newVal: PathValue<Data, P>, oldVal: PathValue<Data, P>) => void,
+  ): () => void;
+};
+
+// reset 函数类型
+type ResetFn = {
+  (): void;
+  (key: string): void;
+};
+
+// destroy 函数类型
+type DestroyFn = () => void;
+
+// snapshot 函数类型
+type SnapshotFn = () => Record<string, unknown>;
 
 // 带计算属性的 Store 返回类型
 export type StoreWithComputed<
@@ -98,7 +186,13 @@ export type StoreWithComputed<
   ExcludeKeys extends keyof Data = never,
   Computed extends Record<string, (...args: any[]) => any> = {},
 > = Store<TransformData<Data, ExcludeKeys>> &
-  ComputedValues<Computed> & { subscribe: SubscribeFn };
+  ComputedValues<Computed> & {
+    // subscribe 使用原始 Data（而非 TransformData），以便 NestedKeyPaths 能正确穿透到嵌套 plain objects
+    subscribe: SubscribeFn<Data>;
+    reset: ResetFn;
+    destroy: DestroyFn;
+    snapshot: SnapshotFn;
+  };
 
 const isBaseType = (value: any): value is BaseType => {
   const type = typeof value;
@@ -138,9 +232,25 @@ export const isGfstateStore = (
   return typeof obj === 'function' && obj[IS_GFSTATE_STORE] === true;
 };
 
+// 获取指定 key 的相等函数（优先使用属性级配置，其次使用全局配置，最后回退到 Object.is）
+const getEqualityFn = (
+  equals: EqualityFn | Partial<Record<string, EqualityFn>> | undefined,
+  key: string,
+): EqualityFn => {
+  if (!equals) return Object.is;
+  if (typeof equals === 'function') return equals;
+  const perKey = (equals as Partial<Record<string, EqualityFn>>)[key];
+  return perKey ?? Object.is;
+};
+
 let run = (fn: VoidFn) => {
   fn();
 };
+
+// enforceActions 严格模式：开启后 state 修改必须在 action 函数内进行
+let enforceActionsEnabled = false;
+// 当前正在执行的 action 嵌套深度（>0 表示在 action 内部）
+let insideActionCount = 0;
 
 // 用于检测循环引用的对象追踪
 const processingObjects = new WeakSet<object>();
@@ -157,16 +267,38 @@ export interface Options<
   // 状态与计算属性key只能唯一，不能重复
   // 计算属性的值可以获取，但不能修改
   computed?: Computed & Record<string, (state: Data) => any>;
-  // 监听状态变化的回调，key 支持 state key、computed key 以及嵌套子 store key
+  // 监听状态变化的回调，key 支持 state key、computed key 以及嵌套子 store key（如 'user.profile.name'）
   watch?: Partial<
     Record<
-      keyof Data | keyof Computed,
+      keyof Data | keyof Computed | NestedKeyPaths<Data> | (string & {}), // 允许任意字符串路径，兼容动态场景
       (newVal: any, oldVal: any, store: any) => void
     >
   >;
   created?: (store: StoreWithComputed<Data, ExcludeKeys, Computed>) => void;
   // 不自动应用gfstate的key
   noGfstateKeys?: ExcludeKeys[];
+  // 插件列表（仅影响当前 store）
+  plugins?: GfstatePlugin[];
+  // Store 名称（用于 DevTools、Logger 等插件标识）
+  storeName?: string;
+  /**
+   * 变更拦截器：在状态写入前拦截
+   * - 返回新值：使用返回值作为最终写入值
+   * - 返回 false：取消本次更新
+   * 可用于数据校验、格式化、权限控制
+   */
+  intercept?: Partial<{
+    [K in keyof Data]: Data[K] extends (...args: any[]) => any
+      ? never
+      : (newVal: Data[K], oldVal: Data[K]) => Data[K] | false;
+  }>;
+  /**
+   * 自定义相等函数，控制何时触发更新
+   * - 全局配置: { equals: shallowEqual }
+   * - 属性级配置: { equals: { items: deepEqual } }
+   * 默认使用 Object.is（严格引用相等）
+   */
+  equals?: EqualityFn | Partial<{ [K in keyof Data]: EqualityFn }>;
 }
 
 const gfstate = <
@@ -201,16 +333,41 @@ const gfstate = <
   // 浅拷贝避免修改用户原始对象
   const data: Data = { ...rawData } as Data;
 
+  // 深拷贝初始数据用于 reset
+  const initialSnapshot: Data = deepClone(rawData);
+
+  // 合并全局插件和 per-store 插件
+  const mergedPlugins: GfstatePlugin[] = [
+    ...getGlobalPlugins(),
+    ...(options?.plugins || []),
+  ];
+
+  // 插件钩子运行器（在 Proxy 创建后赋值）
+  let runBeforeSet: ReturnType<typeof createBeforeSetRunner> = null;
+  let runAfterSet: ReturnType<typeof createAfterSetRunner> = null;
+  let runOnSubscribe: ReturnType<typeof createSubscribeRunner> = null;
+  // 插件 onInit 返回的清理函数
+  const pluginCleanups: VoidFn[] = [];
+
+  // 销毁状态标记
+  let destroyed = false;
+  // 销毁时需要清理的取消订阅函数
+  const cleanupFns: VoidFn[] = [];
+
   processingObjects.add(data);
   // 同时记录原始对象引用，以正确检测循环引用（如 obj.self = obj）
   processingObjects.add(rawData);
 
   const state: State = {} as State;
   const actions: Actions = {} as Actions;
+  // action 的稳定调用包装（带 enforceActions 深度追踪）
+  type ActionWrappers = Record<K, (...args: unknown[]) => unknown>;
+  const actionWrappers: ActionWrappers = {} as ActionWrappers;
   const gfStates: StoreOfGfstate = {} as StoreOfGfstate;
   // 未初始化，但暂时不知道类型的存储。解决hooks规则问题
   const uninitialized: State = {} as State;
   const uninitializedActions: Actions = {} as Actions;
+  const uninitializedActionWrappers: ActionWrappers = {} as ActionWrappers;
 
   // 外部订阅：监听任意属性变更
   type SubscribeCallback = (
@@ -229,6 +386,8 @@ const gfstate = <
     triggerUpdate: () => void;
   };
   const computeds: Record<string, ComputedEntry> = {};
+  // 计算属性调用栈，用于检测循环依赖
+  const computingStack: string[] = [];
 
   // ownKeys 缓存
   let cachedKeys: (string | symbol)[] | null = null;
@@ -251,7 +410,14 @@ const gfstate = <
 
   // 初始化 state 和 actions
   const initStateAndActions = (key: K, initVal: V) => {
-    if (key === 'ref' || key === 'subscribe') return;
+    if (
+      key === 'ref' ||
+      key === 'subscribe' ||
+      key === 'reset' ||
+      key === 'destroy' ||
+      key === 'snapshot'
+    )
+      return;
 
     if (isGfstateStore(initVal)) {
       gfStates[key] = data[key] as Store<Record<string, unknown>>;
@@ -261,6 +427,16 @@ const gfstate = <
 
     if (typeof initVal === 'function') {
       actions[key] = new MemoizedFnHelper(initVal as AnyFn);
+      // 稳定的 action 包装器：追踪 action 调用深度以支持 enforceActions
+      const helper = actions[key];
+      actionWrappers[key] = (...args: unknown[]) => {
+        insideActionCount++;
+        try {
+          return helper.run(...args);
+        } finally {
+          insideActionCount--;
+        }
+      };
       invalidateKeysCache();
       return;
     }
@@ -333,6 +509,13 @@ const gfstate = <
     const reader = new Proxy(data, {
       get: (_target, key: string) => {
         deps.add(key);
+        // 循环依赖检测：如果当前 key 正在被计算（在 computingStack 中），则是循环依赖
+        if (__DEV__ && computingStack.includes(key)) {
+          const chain = [...computingStack, key].join(' → ');
+          throw new Error(
+            `gfstate: 检测到 computed 循环依赖: ${chain}。请检查各 computed 之间的依赖关系，确保不存在互相引用。`,
+          );
+        }
         if (key in gfStates) return gfStates[key];
         // 支持 computed 依赖 computed：返回已缓存的计算值
         if (key in computeds) return computeds[key].cachedValue;
@@ -352,7 +535,14 @@ const gfstate = <
         }
       }
 
-      const { result, deps } = trackDeps(fn);
+      if (__DEV__) computingStack.push(key);
+      let trackResult: { result: unknown; deps: Set<string> };
+      try {
+        trackResult = trackDeps(fn);
+      } finally {
+        if (__DEV__) computingStack.pop();
+      }
+      const { result, deps } = trackResult;
       const setters = new Set<VoidFn>();
 
       computeds[key] = {
@@ -386,7 +576,14 @@ const gfstate = <
       };
 
       const recompute = () => {
-        const { result: newResult, deps: newDeps } = trackDeps(fn);
+        if (__DEV__) computingStack.push(key);
+        let reTrackResult: { result: unknown; deps: Set<string> };
+        try {
+          reTrackResult = trackDeps(fn);
+        } finally {
+          if (__DEV__) computingStack.pop();
+        }
+        const { result: newResult, deps: newDeps } = reTrackResult;
         if (computeds[key].cachedValue !== newResult) {
           const oldResult = computeds[key].cachedValue;
           computeds[key].cachedValue = newResult;
@@ -415,7 +612,44 @@ const gfstate = <
         const unsub = subscribeToDepKey(depKey);
         if (unsub) subscribedDeps.set(depKey, unsub);
       });
+
+      // 注册销毁时清理计算属性订阅
+      cleanupFns.push(() => {
+        subscribedDeps.forEach((unsub) => unsub());
+        subscribedDeps.clear();
+      });
     });
+
+    // 初始化完成后，对 computed 依赖图进行 DFS 检测传递性循环依赖（如 A → B → A）
+    if (__DEV__) {
+      const visitState: Record<string, 'WHITE' | 'GREY' | 'BLACK'> = {};
+      const dfsStack: string[] = [];
+
+      const dfs = (key: string): void => {
+        if (visitState[key] === 'BLACK') return;
+        if (visitState[key] === 'GREY') {
+          const cycleStart = dfsStack.indexOf(key);
+          const chain = [...dfsStack.slice(cycleStart), key].join(' → ');
+          throw new Error(
+            `gfstate: 检测到 computed 循环依赖: ${chain}。请检查各 computed 之间的依赖关系，确保不存在互相引用。`,
+          );
+        }
+        visitState[key] = 'GREY';
+        dfsStack.push(key);
+        const entry = computeds[key];
+        if (entry) {
+          entry.deps.forEach((dep) => {
+            if (dep in computeds) dfs(dep);
+          });
+        }
+        dfsStack.pop();
+        visitState[key] = 'BLACK';
+      };
+
+      Object.keys(computeds).forEach((k) => {
+        if (!visitState[k]) dfs(k);
+      });
+    }
   }
 
   const notifyGlobalListeners = (key: K, newVal: unknown, oldVal: unknown) => {
@@ -434,9 +668,14 @@ const gfstate = <
   Object.keys(gfStates).forEach((gfKey) => {
     const childSubscribe = (gfStates[gfKey as K] as any)[SUBSCRIBE];
     if (typeof childSubscribe === 'function') {
-      childSubscribe((childKey: string, newVal: unknown, oldVal: unknown) => {
-        notifyGlobalListeners(`${gfKey}.${childKey}` as K, newVal, oldVal);
-      });
+      const unsub = childSubscribe(
+        (childKey: string, newVal: unknown, oldVal: unknown) => {
+          notifyGlobalListeners(`${gfKey}.${childKey}` as K, newVal, oldVal);
+        },
+      );
+      if (typeof unsub === 'function') {
+        cleanupFns.push(unsub);
+      }
     }
   });
 
@@ -447,6 +686,7 @@ const gfstate = <
   ) => {
     if (typeof keyOrCb === 'function') {
       globalListeners.add(keyOrCb);
+      if (runOnSubscribe) runOnSubscribe(null);
       return () => globalListeners.delete(keyOrCb);
     }
     const watchKey = keyOrCb;
@@ -454,7 +694,137 @@ const gfstate = <
       if (k === watchKey) cb!(nv, ov);
     };
     globalListeners.add(wrapper);
+    if (runOnSubscribe) runOnSubscribe(watchKey);
     return () => globalListeners.delete(wrapper);
+  };
+
+  // reset 处理函数
+  const resetHandler = (key?: string) => {
+    if (destroyed) {
+      if (__DEV__) {
+        console.warn('gfstate: store 已被销毁，不能执行 reset。');
+      }
+      return;
+    }
+    if (key !== undefined) {
+      // 重置单个 key
+      if (key in gfStates) {
+        // 嵌套子 store 递归重置
+        const childReset = (gfStates[key as K] as any)[RESET];
+        if (typeof childReset === 'function') {
+          childReset();
+        }
+      } else if (key in state) {
+        const initVal = initialSnapshot[key as K];
+        const newVal = deepClone(initVal);
+        if (data[key as K] !== newVal) {
+          const oldVal = data[key as K];
+          data[key as K] = newVal;
+          run(() => state[key as K].triggerUpdate());
+          notifyGlobalListeners(key as K, newVal, oldVal);
+          if (runAfterSet) runAfterSet(key, newVal, oldVal);
+        }
+      }
+    } else {
+      // 重置所有 key
+      Object.keys(state).forEach((k) => {
+        const initVal = initialSnapshot[k as K];
+        const newVal = deepClone(initVal);
+        if (data[k as K] !== newVal) {
+          const oldVal = data[k as K];
+          data[k as K] = newVal;
+          run(() => state[k as K].triggerUpdate());
+          notifyGlobalListeners(k as K, newVal, oldVal);
+          if (runAfterSet) runAfterSet(k, newVal, oldVal);
+        }
+      });
+      // 递归重置所有嵌套子 store
+      Object.keys(gfStates).forEach((k) => {
+        const childReset = (gfStates[k as K] as any)[RESET];
+        if (typeof childReset === 'function') {
+          childReset();
+        }
+      });
+    }
+  };
+
+  // destroy 处理函数
+  const destroyHandler = () => {
+    if (destroyed) return;
+
+    // onDestroy 钩子（在清理前调用，插件仍可访问 store）
+    mergedPlugins.forEach((plugin) => {
+      if (plugin.onDestroy) {
+        try {
+          plugin.onDestroy(pluginContext);
+        } catch (e) {
+          if (__DEV__) {
+            console.error(
+              `gfstate 插件 "${plugin.name}" onDestroy 执行出错:`,
+              e,
+            );
+          }
+        }
+      }
+    });
+
+    // 清理插件 onInit 返回的清理函数
+    pluginCleanups.forEach((fn) => fn());
+    pluginCleanups.length = 0;
+
+    destroyed = true;
+
+    // 清理所有清理函数（watch、子 store 订阅等）
+    cleanupFns.forEach((fn) => fn());
+    cleanupFns.length = 0;
+
+    // 清理外部订阅
+    globalListeners.clear();
+
+    // 递归销毁所有嵌套子 store
+    Object.keys(gfStates).forEach((k) => {
+      const childDestroy = (gfStates[k as K] as any)[DESTROY];
+      if (typeof childDestroy === 'function') {
+        childDestroy();
+      }
+    });
+  };
+
+  // snapshot 处理函数
+  const snapshotHandler = (): Record<string, unknown> => {
+    if (destroyed) {
+      if (__DEV__) {
+        console.warn('gfstate: store 已被销毁，不能执行 snapshot。');
+      }
+      return {};
+    }
+
+    const result: Record<string, unknown> = {};
+
+    // 普通 state
+    Object.keys(state).forEach((k) => {
+      result[k] = deepClone(data[k as K]);
+    });
+
+    // 嵌套子 store 递归 snapshot
+    Object.keys(gfStates).forEach((k) => {
+      const childSnapshot = (gfStates[k as K] as any)[SNAPSHOT];
+      if (typeof childSnapshot === 'function') {
+        result[k] = childSnapshot();
+      }
+    });
+
+    // computed 值
+    Object.keys(computeds).forEach((k) => {
+      result[k] = deepClone(computeds[k].cachedValue);
+    });
+
+    // ref
+    if ('ref' in data) {
+      result.ref = deepClone(data['ref' as K]);
+    }
+
+    return result;
   };
 
   // 尝试使用 useSyncExternalStore，非 React 环境下回退到直接返回值
@@ -477,6 +847,14 @@ const gfstate = <
     key: K,
     val: unknown | SetKeyAction<V> | Store<Record<string, unknown>>,
   ) => {
+    if (destroyed) {
+      if (__DEV__) {
+        console.warn(
+          `gfstate: store 已被销毁，不应再写入属性 "${key as string}"。`,
+        );
+      }
+      return;
+    }
     if (key === 'ref') {
       data[key] = val as V;
       return;
@@ -484,6 +862,12 @@ const gfstate = <
     if (key === 'subscribe') {
       if (__DEV__) {
         console.warn('gfstate: "subscribe" 是保留属性名，不能赋值。');
+      }
+      return;
+    }
+    if (key === 'reset' || key === 'destroy' || key === 'snapshot') {
+      if (__DEV__) {
+        console.warn(`gfstate: "${key as string}" 是保留属性名，不能赋值。`);
       }
       return;
     }
@@ -507,12 +891,52 @@ const gfstate = <
       return;
     }
     if (key in state) {
-      const newVal = typeof val === 'function' ? val(data[key]) : val;
-      if (data[key] !== newVal) {
-        const oldVal = data[key];
+      // enforceActions 严格模式：state 修改必须在 action 内
+      if (enforceActionsEnabled && insideActionCount === 0) {
+        if (__DEV__) {
+          throw new Error(
+            `gfstate enforceActions: 不允许在 action 外直接修改状态 "${
+              key as string
+            }"，请将此操作封装在 action 函数中。`,
+          );
+        }
+        return;
+      }
+
+      let newVal = typeof val === 'function' ? val(data[key]) : val;
+      const oldVal = data[key];
+
+      // intercept 变更拦截器：在写入前拦截，可修改值或取消更新
+      const interceptFn = options?.intercept
+        ? (options.intercept as any)[key as string]
+        : undefined;
+      if (typeof interceptFn === 'function') {
+        const interceptResult = interceptFn(newVal, oldVal);
+        if (interceptResult === false) return; // 拦截器取消本次更新
+        newVal = interceptResult as V;
+      }
+
+      // 自定义相等函数（取代原始的 !==，支持 shallowEqual/deepEqual 等）
+      const equalFn = getEqualityFn(options?.equals as any, key as string);
+      if (!equalFn(oldVal, newVal)) {
+        // onBeforeSet 钩子
+        if (runBeforeSet) {
+          const result = runBeforeSet(key as string, newVal, oldVal);
+          if (result === false) return; // 插件取消了设置
+          if (result && typeof result === 'object' && 'value' in result) {
+            newVal = result.value as V;
+            if (equalFn(oldVal, newVal)) return; // 替换后与旧值相同，跳过
+          }
+        }
+
         data[key] = newVal;
         run(() => state[key].triggerUpdate());
         notifyGlobalListeners(key, newVal, oldVal);
+
+        // onAfterSet 钩子
+        if (runAfterSet) {
+          runAfterSet(key as string, newVal, oldVal);
+        }
       }
       return;
     }
@@ -526,9 +950,19 @@ const gfstate = <
         uninitializedActions[key].update(val as AnyFn);
       } else {
         uninitializedActions[key] = new MemoizedFnHelper(val as AnyFn);
+        const helper = uninitializedActions[key];
+        uninitializedActionWrappers[key] = (...args: unknown[]) => {
+          insideActionCount++;
+          try {
+            return helper.run(...args);
+          } finally {
+            insideActionCount--;
+          }
+        };
       }
-      if (data[key] !== uninitializedActions[key].run) {
-        data[key] = uninitializedActions[key].run as any;
+      const wrapper = uninitializedActionWrappers[key];
+      if (data[key] !== wrapper) {
+        data[key] = wrapper as any;
         run(() => uninitialized[key].triggerUpdate());
       }
       return;
@@ -545,18 +979,55 @@ const gfstate = <
     if (key === 'ref') return data[key];
     if (key === IS_GFSTATE_STORE) return true;
     if (key === SUBSCRIBE || key === 'subscribe') return subscribeHandler;
-    if (key in gfStates) return gfStates[key];
-    if (key in actions) return actions[key].run;
+    if (key === RESET || key === 'reset') return resetHandler;
+    if (key === DESTROY || key === 'destroy') return destroyHandler;
+    if (key === SNAPSHOT || key === 'snapshot') return snapshotHandler;
+    if (key in gfStates) {
+      if (destroyed) {
+        if (__DEV__) {
+          console.warn(
+            `gfstate: store 已被销毁，不应再读取属性 "${key as string}"。`,
+          );
+        }
+      }
+      return gfStates[key];
+    }
+    if (key in actions) {
+      if (destroyed) {
+        if (__DEV__) {
+          console.warn(
+            `gfstate: store 已被销毁，不应再读取属性 "${key as string}"。`,
+          );
+        }
+      }
+      return actionWrappers[key];
+    }
 
     // 计算属性
     if ((key as string) in computeds) {
       const computed = computeds[key as string];
-      return useStoreValue(computed, () => computed.cachedValue);
+      const value = useStoreValue(computed, () => computed.cachedValue);
+      if (destroyed) {
+        if (__DEV__) {
+          console.warn(
+            `gfstate: store 已被销毁，不应再读取属性 "${key as string}"。`,
+          );
+        }
+      }
+      return value;
     }
 
     // state
     if (key in state) {
-      return useStoreValue(state[key], () => data[key]);
+      const value = useStoreValue(state[key], () => data[key]);
+      if (destroyed) {
+        if (__DEV__) {
+          console.warn(
+            `gfstate: store 已被销毁，不应再读取属性 "${key as string}"。`,
+          );
+        }
+      }
+      return value;
     }
 
     // 未初始化的 key
@@ -672,9 +1143,29 @@ const gfstate = <
   if (options?.watch) {
     Object.entries(options.watch).forEach(([key, watchFn]) => {
       if (!watchFn) return;
+
+      // 嵌套路径（如 'user.profile.name'）：通过全局监听器过滤精确路径
+      if ((key as string).includes('.')) {
+        const wrapper: SubscribeCallback = (k, nv, ov) => {
+          if (k === key) {
+            try {
+              watchFn(nv, ov, instance);
+            } catch (e) {
+              console.error(
+                `gfstate watch: 嵌套路径 "${key}" 的监听回调执行出错:`,
+                e,
+              );
+            }
+          }
+        };
+        globalListeners.add(wrapper);
+        cleanupFns.push(() => globalListeners.delete(wrapper));
+        return;
+      }
+
       if (key in state) {
         let oldValue = data[key as K];
-        state[key as K].subscribe(() => {
+        const unsub = state[key as K].subscribe(() => {
           const newValue = data[key as K];
           if (newValue !== oldValue) {
             const prev = oldValue;
@@ -689,10 +1180,11 @@ const gfstate = <
             }
           }
         });
+        cleanupFns.push(unsub);
       } else if (key in computeds) {
         // 监听计算属性变更
         let oldValue = computeds[key].cachedValue;
-        computeds[key].subscribe(() => {
+        const unsub = computeds[key].subscribe(() => {
           const newValue = computeds[key].cachedValue;
           if (newValue !== oldValue) {
             const prev = oldValue;
@@ -707,11 +1199,12 @@ const gfstate = <
             }
           }
         });
+        cleanupFns.push(unsub);
       } else if (key in gfStates) {
         // 监听嵌套子 store 的任意属性变更
         const childSubscribe = (gfStates[key] as any)[SUBSCRIBE];
         if (typeof childSubscribe === 'function') {
-          childSubscribe(
+          const unsub = childSubscribe(
             (changedKey: string, newVal: unknown, oldVal: unknown) => {
               try {
                 watchFn(newVal, oldVal, instance);
@@ -723,6 +1216,9 @@ const gfstate = <
               }
             },
           );
+          if (typeof unsub === 'function') {
+            cleanupFns.push(unsub);
+          }
         }
       } else if (__DEV__) {
         console.warn(
@@ -735,14 +1231,61 @@ const gfstate = <
   // 执行生命周期created
   options?.created?.(instance);
 
+  // 创建插件上下文并初始化钩子运行器
+  const pluginContext: PluginContext = {
+    store: instance,
+    storeName: options?.storeName || 'anonymous',
+    getSnapshot: snapshotHandler,
+    getInitialData: () => deepClone(initialSnapshot),
+  };
+
+  if (mergedPlugins.length > 0) {
+    runBeforeSet = createBeforeSetRunner(mergedPlugins, pluginContext);
+    runAfterSet = createAfterSetRunner(mergedPlugins, pluginContext);
+    runOnSubscribe = createSubscribeRunner(mergedPlugins, pluginContext);
+
+    // 执行插件 onInit 钩子
+    mergedPlugins.forEach((plugin) => {
+      if (plugin.onInit) {
+        try {
+          const cleanup = plugin.onInit(pluginContext);
+          if (typeof cleanup === 'function') {
+            pluginCleanups.push(cleanup);
+          }
+        } catch (e) {
+          if (__DEV__) {
+            console.error(`gfstate 插件 "${plugin.name}" onInit 执行出错:`, e);
+          }
+        }
+      }
+    });
+  }
+
   processingObjects.delete(data);
   processingObjects.delete(rawData);
 
   return instance;
 };
 
-gfstate.config = ({ batch }: { batch: typeof run }) => {
-  run = batch;
+gfstate.config = ({
+  batch,
+  enforceActions,
+}: {
+  batch?: typeof run;
+  enforceActions?: boolean;
+}) => {
+  if (batch !== undefined) run = batch;
+  if (enforceActions !== undefined) enforceActionsEnabled = enforceActions;
+};
+
+// 注册全局插件
+gfstate.use = (plugin: GfstatePlugin) => {
+  registerGlobalPlugin(plugin);
+};
+
+// 清除所有全局插件（用于测试）
+gfstate.clearPlugins = () => {
+  clearGlobalPlugins();
 };
 
 export default gfstate;

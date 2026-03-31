@@ -1,6 +1,6 @@
 {
   "name": "gfstate",
-  "version": "0.0.1-alpha.11",
+  "version": "0.1.0",
   "description": "React简单但高性能的状态管理库",
   "scripts": {
     "start": "npm run dev",

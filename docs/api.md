@@ -57,8 +57,22 @@ interface Options<Data, ExcludeKeys, Computed> {
   >;
   created?: (store: StoreWithComputed<Data, ExcludeKeys, Computed>) => void;
   noGfstateKeys?: ExcludeKeys[];
+  plugins?: GfstatePlugin[];
+  storeName?: string;
 }
 ```
+
+##### options.plugins
+
+- **类型**: `GfstatePlugin[]`
+- **可选**: 是
+- **描述**: 局部插件数组，仅对当前 store 生效。插件可以在 store 各生命周期节点注入逻辑。详见[插件系统](/plugins)。
+
+##### options.storeName
+
+- **类型**: `string`
+- **可选**: 是
+- **描述**: Store 名称，用于插件标识（如 logger 和 devtools 中的显示名称）。未指定时默认为 `'anonymous'`。
 
 ##### options.computed
 
@@ -252,6 +266,174 @@ store.name = 'Bob'; // 不触发回调
 ```
 
 > **注意**: `subscribe` 是保留属性名，不能作为 state key 使用。嵌套子 store 变更的 key 使用点号路径格式（如 `nested.x`）。
+
+### 重置状态
+
+`store.reset()` 将状态恢复到初始值（深拷贝）。
+
+```typescript
+type ResetFn = {
+  (): void; // 重置所有 key
+  (key: string): void; // 重置单个 key
+};
+```
+
+```typescript
+const store = gfstate({ count: 0, name: 'Alice' });
+store.count = 99;
+store.name = 'Bob';
+
+store.reset('count'); // 只重置 count → 0，name 不变
+store.reset(); // 重置所有 → count: 0, name: 'Alice'
+```
+
+- 触发 computed 重新计算和 watch 回调
+- 嵌套子 store 递归重置
+- 销毁后调用会产生开发模式警告
+
+### 销毁 Store
+
+`store.destroy()` 清除所有订阅和监听器，标记 store 为已销毁。
+
+```typescript
+type DestroyFn = () => void;
+```
+
+```typescript
+const store = gfstate({ count: 0, nested: { x: 1 } });
+store.destroy();
+// 之后读写会产生开发模式警告
+```
+
+- 递归销毁嵌套子 store
+- 幂等操作，多次调用安全
+
+### 状态快照
+
+`store.snapshot()` 返回当前状态的深拷贝纯 JS 对象，无 Proxy。
+
+```typescript
+type SnapshotFn = () => Record<string, unknown>;
+```
+
+```typescript
+const store = gfstate(
+  { count: 5, nested: { x: 1 } },
+  { computed: { double: (s) => s.count * 2 } },
+);
+const snap = store.snapshot();
+// { count: 5, nested: { x: 1 }, double: 10 }
+JSON.stringify(snap); // 安全序列化
+```
+
+- 包含 state、computed、嵌套子 store 和 ref 的值
+- 修改快照不影响原 store
+- 销毁后返回 `{}`
+
+> **注意**: `reset`、`destroy`、`snapshot` 也是保留属性名，不能作为 state key。
+
+## gfstate.use() — 全局插件注册
+
+```typescript
+function use(plugin: GfstatePlugin): void;
+```
+
+注册全局插件，对后续创建的所有 store 生效。同名插件会自动去重。
+
+```typescript
+import { gfstate, logger } from 'gfstate';
+
+gfstate.use(logger()); // 所有后续创建的 store 都会有日志
+```
+
+## gfstate.clearPlugins() — 清除全局插件
+
+```typescript
+function clearPlugins(): void;
+```
+
+清除所有已注册的全局插件，主要用于测试。
+
+```typescript
+beforeEach(() => {
+  gfstate.clearPlugins();
+});
+```
+
+## 插件接口
+
+### GfstatePlugin
+
+```typescript
+interface GfstatePlugin {
+  name: string;
+  onInit?: (context: PluginContext) => void | (() => void);
+  onBeforeSet?: (
+    key: string,
+    newVal: unknown,
+    oldVal: unknown,
+    context: PluginContext,
+  ) => void | { value: unknown } | false;
+  onAfterSet?: (
+    key: string,
+    newVal: unknown,
+    oldVal: unknown,
+    context: PluginContext,
+  ) => void;
+  onSubscribe?: (key: string | null, context: PluginContext) => void;
+  onDestroy?: (context: PluginContext) => void;
+}
+```
+
+### PluginContext
+
+```typescript
+interface PluginContext {
+  store: any;
+  storeName: string;
+  getSnapshot: () => Record<string, unknown>;
+  getInitialData: () => Record<string, unknown>;
+}
+```
+
+### 生命周期钩子说明
+
+| 钩子          | 触发时机                   | 返回值                                            |
+| ------------- | -------------------------- | ------------------------------------------------- |
+| `onInit`      | store 创建完成后           | `void` 或清理函数                                 |
+| `onBeforeSet` | 属性赋值前                 | `void`（不干预）/ `{value}` 替换值 / `false` 取消 |
+| `onAfterSet`  | 属性赋值完成后             | `void`                                            |
+| `onSubscribe` | `store.subscribe()` 调用时 | `void`                                            |
+| `onDestroy`   | `store.destroy()` 调用时   | `void`                                            |
+
+## 内置插件
+
+### logger(options?)
+
+```typescript
+import { logger } from 'gfstate';
+import type { LoggerOptions } from 'gfstate';
+```
+
+记录 state 变更到控制台。详见[插件系统 - logger](/plugins#logger--日志插件)。
+
+### persist(options)
+
+```typescript
+import { persist } from 'gfstate';
+import type { PersistOptions, StorageAdapter } from 'gfstate';
+```
+
+将 store 状态持久化到 localStorage 或自定义存储。详见[插件系统 - persist](/plugins#persist--状态持久化插件)。
+
+### devtools(options?)
+
+```typescript
+import { devtools } from 'gfstate';
+import type { DevToolsOptions } from 'gfstate';
+```
+
+连接 Redux DevTools Extension，支持时间旅行调试。详见[插件系统 - devtools](/plugins#devtools--redux-devtools-连接)。
 
 ## gfstate.config()
 
@@ -459,7 +641,7 @@ console.log(store.items === EMPTY_ARRAY); // true
 
 ## 类型导出
 
-### Store<Data>
+### `Store<Data>`
 
 ```typescript
 type Store<Data> = Data & SetStore<Data>;
@@ -467,7 +649,7 @@ type Store<Data> = Data & SetStore<Data>;
 
 一个既是数据对象，又可以作为函数调用来执行更新的类型。
 
-### TransformData<Data, ExcludeKeys>
+### `TransformData<Data, ExcludeKeys>`
 
 ```typescript
 type TransformData<Data, ExcludeKeys> = {
@@ -483,18 +665,23 @@ type TransformData<Data, ExcludeKeys> = {
 
 递归地将普通对象属性转换为 Store 类型，排除 `ref` 和 `noGfstateKeys` 中的属性。
 
-### StoreWithComputed<Data, ExcludeKeys, Computed>
+### `StoreWithComputed<Data, ExcludeKeys, Computed>`
 
 ```typescript
 type StoreWithComputed<Data, ExcludeKeys, Computed> = Store<
   TransformData<Data, ExcludeKeys>
 > &
-  ComputedValues<Computed> & { subscribe: SubscribeFn };
+  ComputedValues<Computed> & {
+    subscribe: SubscribeFn;
+    reset: ResetFn;
+    destroy: DestroyFn;
+    snapshot: SnapshotFn;
+  };
 ```
 
-包含计算属性和 subscribe 方法的 Store 类型。
+包含计算属性、subscribe、reset、destroy 和 snapshot 方法的 Store 类型。
 
-### StoreWithStateAndProps<State, Props, Action, Ref, ExcludeKeys>
+### `StoreWithStateAndProps<State, Props, Action, Ref, ExcludeKeys>`
 
 ```typescript
 interface StoreWithStateAndProps<
@@ -513,7 +700,7 @@ interface StoreWithStateAndProps<
 
 useStore 返回值的结构。
 
-### Options<Data, ExcludeKeys, Computed>
+### `Options<Data, ExcludeKeys, Computed>`
 
 ```typescript
 interface Options<Data, ExcludeKeys, Computed> {
@@ -523,10 +710,62 @@ interface Options<Data, ExcludeKeys, Computed> {
   >;
   created?: (store: StoreWithComputed<Data, ExcludeKeys, Computed>) => void;
   noGfstateKeys?: ExcludeKeys[];
+  plugins?: GfstatePlugin[];
+  storeName?: string;
 }
 ```
 
 gfstate 和 useStore 的配置选项。
+
+## 插件相关类型导出
+
+### GfstatePlugin
+
+```typescript
+import type { GfstatePlugin } from 'gfstate';
+```
+
+插件接口定义。
+
+### PluginContext
+
+```typescript
+import type { PluginContext } from 'gfstate';
+```
+
+插件上下文类型。
+
+### LoggerOptions
+
+```typescript
+import type { LoggerOptions } from 'gfstate';
+```
+
+logger 插件配置选项类型。
+
+### PersistOptions
+
+```typescript
+import type { PersistOptions } from 'gfstate';
+```
+
+persist 插件配置选项类型。
+
+### StorageAdapter
+
+```typescript
+import type { StorageAdapter } from 'gfstate';
+```
+
+persist 插件存储适配器接口。
+
+### DevToolsOptions
+
+```typescript
+import type { DevToolsOptions } from 'gfstate';
+```
+
+devtools 插件配置选项类型。
 
 ## 常量导出
 
@@ -537,6 +776,30 @@ export declare const IS_GFSTATE_STORE: unique symbol;
 ```
 
 gfstate 内部使用的标记符号。每个 gfstate store 对象在访问这个符号时返回 `true`。
+
+### RESET
+
+```typescript
+export declare const RESET: unique symbol;
+```
+
+`store.reset()` 的 Symbol 标识，可通过 `store[RESET]()` 调用。
+
+### DESTROY
+
+```typescript
+export declare const DESTROY: unique symbol;
+```
+
+`store.destroy()` 的 Symbol 标识，可通过 `store[DESTROY]()` 调用。
+
+### SNAPSHOT
+
+```typescript
+export declare const SNAPSHOT: unique symbol;
+```
+
+`store.snapshot()` 的 Symbol 标识，可通过 `store[SNAPSHOT]()` 调用。
 
 ## 支持的数据类型
 

@@ -7,6 +7,8 @@ import gfstate, {
   IS_GFSTATE_STORE,
   isGfstateStore,
   isPlainObject,
+  shallowEqual,
+  deepEqual,
   type Store,
   syncWrapper,
   // asyncWrapper,
@@ -2301,9 +2303,7 @@ describe('GfState', () => {
       const cb = (_key: string, newVal: unknown) => results1.push(newVal);
       store.subscribe(cb);
       store.subscribe(cb); // Set 去重，不会重复添加
-      store.subscribe((_key: string, newVal: unknown) =>
-        results2.push(newVal),
-      );
+      store.subscribe((_key: string, newVal: unknown) => results2.push(newVal));
 
       store.count = 1;
       // cb 在 Set 中只有一份
@@ -2312,9 +2312,7 @@ describe('GfState', () => {
     });
 
     test('store("subscribe", val) 应发出警告', () => {
-      const warnSpy = jest
-        .spyOn(console, 'warn')
-        .mockImplementation(() => {});
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
       const store = gfstate({ count: 0 });
       store('subscribe' as any, 'test');
       expect(warnSpy).toHaveBeenCalledWith(
@@ -2421,16 +2419,802 @@ describe('GfState', () => {
 
   describe('watch 边界', () => {
     test('watch 监听 action key 应打印警告', () => {
-      const warnSpy = jest
-        .spyOn(console, 'warn')
-        .mockImplementation(() => {});
-      gfstate(
-        { count: 0, inc: () => {} },
-        { watch: { inc: () => {} } as any },
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      gfstate({ count: 0, inc: () => {} }, { watch: { inc: () => {} } as any });
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('inc'));
+      warnSpy.mockRestore();
+    });
+  });
+
+  // ========== Phase 2: Store 生命周期与快照 ==========
+
+  describe('store.reset()', () => {
+    test('reset() 重置所有 state 到初始值', () => {
+      const store = gfstate({ count: 0, name: 'init' });
+
+      store.count = 10;
+      store.name = 'changed';
+      expect(store.count).toBe(10);
+      expect(store.name).toBe('changed');
+
+      store.reset();
+      expect(store.count).toBe(0);
+      expect(store.name).toBe('init');
+    });
+
+    test('reset("key") 重置单个 key', () => {
+      const store = gfstate({ a: 1, b: 2 });
+
+      store.a = 10;
+      store.b = 20;
+
+      store.reset('a');
+      expect(store.a).toBe(1);
+      expect(store.b).toBe(20);
+    });
+
+    test('reset 触发组件重新渲染', () => {
+      const store = gfstate({ count: 0 });
+
+      const App = () => {
+        const { count } = store;
+        return (
+          <>
+            <p>count:{count}</p>
+            <button onClick={() => (store.count = 99)}>set</button>
+            <button onClick={() => store.reset()}>reset</button>
+          </>
+        );
+      };
+
+      const { getByText } = render(<App />);
+      expect(getByText('count:0')).toBeInTheDocument();
+
+      fireEvent.click(getByText('set'));
+      expect(getByText('count:99')).toBeInTheDocument();
+
+      fireEvent.click(getByText('reset'));
+      expect(getByText('count:0')).toBeInTheDocument();
+    });
+
+    test('reset 触发 computed 重算', () => {
+      const store = gfstate(
+        { count: 0 },
+        {
+          computed: {
+            double: (s) => s.count * 2,
+          },
+        },
       );
-      expect(warnSpy).toHaveBeenCalledWith(
-        expect.stringContaining('inc'),
+
+      store.count = 5;
+      expect((store as any).double).toBe(10);
+
+      store.reset();
+      expect((store as any).double).toBe(0);
+    });
+
+    test('reset 触发 watch 回调', () => {
+      const changes: Array<{ newVal: unknown; oldVal: unknown }> = [];
+
+      const store = gfstate(
+        { count: 5 },
+        {
+          watch: {
+            count: (newVal, oldVal) => {
+              changes.push({ newVal, oldVal });
+            },
+          },
+        },
       );
+
+      store.count = 10;
+      expect(changes).toHaveLength(1);
+
+      store.reset();
+      expect(changes).toHaveLength(2);
+      expect(changes[1]).toEqual({ newVal: 5, oldVal: 10 });
+    });
+
+    test('reset 嵌套子 store 递归重置', () => {
+      const store = gfstate({
+        nested: { x: 1, y: 2 },
+      });
+
+      (store.nested as any).x = 100;
+      (store.nested as any).y = 200;
+      expect((store.nested as any).x).toBe(100);
+      expect((store.nested as any).y).toBe(200);
+
+      store.reset();
+      expect((store.nested as any).x).toBe(1);
+      expect((store.nested as any).y).toBe(2);
+    });
+
+    test('reset("nestedKey") 重置嵌套子 store', () => {
+      const store = gfstate({
+        nested: { x: 1, y: 2 },
+        count: 0,
+      });
+
+      (store.nested as any).x = 100;
+      store.count = 99;
+
+      store.reset('nested');
+      expect((store.nested as any).x).toBe(1);
+      expect(store.count).toBe(99);
+    });
+
+    test('reset 使用深拷贝，不共享引用', () => {
+      const store = gfstate({ items: [1, 2, 3] });
+
+      store.reset();
+      const items1 = store.items;
+
+      store.reset();
+      const items2 = store.items;
+
+      // 每次 reset 应返回新引用
+      expect(items1).not.toBe(items2);
+      expect(items1).toEqual([1, 2, 3]);
+      expect(items2).toEqual([1, 2, 3]);
+    });
+
+    test('reset 值相同时不触发通知', () => {
+      const store = gfstate({ count: 0 });
+      const changes: unknown[] = [];
+
+      store.subscribe((_key, newVal) => {
+        changes.push(newVal);
+      });
+
+      // count 已经是 0，reset 不应触发
+      store.reset();
+      expect(changes).toHaveLength(0);
+    });
+  });
+
+  describe('store.destroy()', () => {
+    test('destroy 后读取属性给出开发模式警告', () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+      const store = gfstate({ count: 0 });
+      store.destroy();
+
+      const val = store.count;
+      // destroy 后仍返回最后已知值（而非 undefined），以避免违反 React hooks 规则
+      expect(val).toBe(0);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('已被销毁'));
+
+      warnSpy.mockRestore();
+    });
+
+    test('destroy 后写入属性给出开发模式警告', () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+      const store = gfstate({ count: 0 });
+      store.destroy();
+
+      store.count = 10;
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('已被销毁'));
+
+      warnSpy.mockRestore();
+    });
+
+    test('destroy 清理外部订阅', () => {
+      const store = gfstate({ count: 0 });
+      const changes: unknown[] = [];
+
+      store.subscribe((_key, newVal) => {
+        changes.push(newVal);
+      });
+
+      store.count = 1;
+      expect(changes).toHaveLength(1);
+
+      store.destroy();
+
+      // 销毁后订阅不再触发
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      store.count = 2;
+      expect(changes).toHaveLength(1); // 不增加
+
+      warnSpy.mockRestore();
+    });
+
+    test('destroy 递归销毁嵌套子 store', () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+      const store = gfstate({
+        nested: { x: 1 },
+      });
+
+      const nested = store.nested;
+      store.destroy();
+
+      // 嵌套子 store 也被销毁，但仍返回最后已知值（避免违反 React hooks 规则）
+      const val = (nested as any).x;
+      expect(val).toBe(1);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('已被销毁'));
+
+      warnSpy.mockRestore();
+    });
+
+    test('destroy 多次调用安全幂等', () => {
+      const store = gfstate({ count: 0 });
+
+      expect(() => {
+        store.destroy();
+        store.destroy();
+      }).not.toThrow();
+    });
+
+    test('destroy 后 reset 给出警告', () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+      const store = gfstate({ count: 0 });
+      store.destroy();
+      store.reset();
+
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('已被销毁'));
+      warnSpy.mockRestore();
+    });
+
+    test('destroy 后 snapshot 给出警告并返回空对象', () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+      const store = gfstate({ count: 0 });
+      store.destroy();
+      const snap = store.snapshot();
+
+      expect(snap).toEqual({});
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('已被销毁'));
+      warnSpy.mockRestore();
+    });
+
+    test('destroy 保留 IS_GFSTATE_STORE 和 destroy/reset/snapshot 的可访问性', () => {
+      const store = gfstate({ count: 0 });
+      store.destroy();
+
+      expect(isGfstateStore(store)).toBe(true);
+      expect(typeof store.destroy).toBe('function');
+      expect(typeof store.reset).toBe('function');
+      expect(typeof store.snapshot).toBe('function');
+    });
+  });
+
+  describe('store.snapshot()', () => {
+    test('snapshot 返回纯对象，含 state 值', () => {
+      const store = gfstate({ count: 5, name: 'hello' });
+      const snap = store.snapshot();
+
+      expect(snap).toEqual({ count: 5, name: 'hello' });
+      expect(isPlainObject(snap)).toBe(true);
+      expect(isGfstateStore(snap)).toBe(false);
+    });
+
+    test('snapshot 包含 computed 值', () => {
+      const store = gfstate(
+        { count: 3 },
+        {
+          computed: {
+            double: (s) => s.count * 2,
+          },
+        },
+      );
+
+      const snap = store.snapshot();
+      expect(snap.count).toBe(3);
+      expect(snap.double).toBe(6);
+    });
+
+    test('snapshot 包含嵌套子 store 的值', () => {
+      const store = gfstate({
+        nested: { x: 1, y: 2 },
+        count: 0,
+      });
+
+      (store.nested as any).x = 10;
+      const snap = store.snapshot();
+
+      expect(snap.count).toBe(0);
+      expect(snap.nested).toEqual({ x: 10, y: 2 });
+      expect(isPlainObject(snap.nested)).toBe(true);
+    });
+
+    test('snapshot 返回深拷贝，修改快照不影响 store', () => {
+      const store = gfstate({ items: [1, 2, 3] });
+      const snap = store.snapshot();
+
+      (snap.items as number[]).push(4);
+      expect(store.items).toEqual([1, 2, 3]);
+    });
+
+    test('snapshot 包含 ref 值', () => {
+      const store = gfstate({ count: 0, ref: { timer: 42 } });
+      const snap = store.snapshot();
+
+      expect(snap.ref).toEqual({ timer: 42 });
+    });
+
+    test('snapshot 多层嵌套子 store', () => {
+      const store = gfstate({
+        a: {
+          b: {
+            c: 1,
+          },
+        },
+      });
+
+      (store as any).a.b.c = 99;
+      const snap = store.snapshot();
+
+      expect(snap).toEqual({ a: { b: { c: 99 } } });
+    });
+
+    test('snapshot 包含 Date / Map / Set 等非纯对象', () => {
+      const date = new Date('2024-01-01');
+      const store = gfstate({
+        date: date as Date,
+        map: new Map([['a', 1]]) as Map<string, number>,
+      });
+
+      const snap = store.snapshot();
+      expect(snap.date).toEqual(date);
+      expect(snap.date).not.toBe(date); // 深拷贝
+      expect(snap.map).toEqual(new Map([['a', 1]]));
+    });
+  });
+
+  describe('Phase 4：TypeScript 增强与 DX 提升', () => {
+    // ============================
+    // intercept 变更拦截器
+    // ============================
+    describe('intercept 变更拦截器', () => {
+      test('intercept 返回 false 取消本次更新', () => {
+        const store = gfstate(
+          { count: 0 },
+          {
+            intercept: {
+              count: (newVal) => {
+                // 禁止负数
+                if (newVal < 0) return false;
+                return newVal;
+              },
+            },
+          },
+        );
+
+        const App = () => {
+          const { count } = store;
+          return <p>{count}</p>;
+        };
+
+        const { getByText } = render(<App />);
+        expect(getByText('0')).toBeInTheDocument();
+
+        // 正常赋值
+        act(() => {
+          store.count = 5;
+        });
+        expect(getByText('5')).toBeInTheDocument();
+
+        // 负数被拦截，count 保持 5
+        act(() => {
+          store.count = -1;
+        });
+        expect(getByText('5')).toBeInTheDocument();
+      });
+
+      test('intercept 返回修改后的值（格式化）', () => {
+        const store = gfstate(
+          { name: '' },
+          {
+            intercept: {
+              name: (newVal) => newVal.trim().toUpperCase(),
+            },
+          },
+        );
+
+        store.name = '  hello world  ';
+        expect(store.name).toBe('HELLO WORLD');
+      });
+
+      test('intercept 可以访问 oldVal', () => {
+        const interceptArgs: Array<[number, number]> = [];
+        const store = gfstate(
+          { count: 10 },
+          {
+            intercept: {
+              count: (newVal, oldVal) => {
+                interceptArgs.push([newVal, oldVal]);
+                return newVal;
+              },
+            },
+          },
+        );
+
+        store.count = 20;
+        expect(interceptArgs).toEqual([[20, 10]]);
+      });
+
+      test('intercept 不影响未拦截的 key', () => {
+        const store = gfstate(
+          { count: 0, text: 'hello' },
+          {
+            intercept: {
+              count: (newVal) => {
+                if (newVal < 0) return false;
+                return newVal;
+              },
+            },
+          },
+        );
+
+        store.text = 'world';
+        expect(store.text).toBe('world');
+
+        store.count = -5;
+        expect(store.count).toBe(0); // 被拦截
+      });
+    });
+
+    // ============================
+    // equals 自定义相等函数
+    // ============================
+    describe('equals 自定义相等函数', () => {
+      test('全局 shallowEqual：浅层相等时不触发更新', () => {
+        let renderCount = 0;
+        const store = gfstate(
+          {
+            filter: { status: 'active', page: 1 } as {
+              status: string;
+              page: number;
+            },
+          },
+          { noGfstateKeys: ['filter'], equals: shallowEqual },
+        );
+
+        const App = () => {
+          renderCount++;
+          const { filter } = store;
+          return <p>{JSON.stringify(filter)}</p>;
+        };
+
+        const { getByText } = render(<App />);
+        const initialRenderCount = renderCount;
+
+        // 替换为浅层相等的新对象（shallowEqual 认为相等，不触发更新）
+        act(() => {
+          store.filter = { status: 'active', page: 1 };
+        });
+        expect(renderCount).toBe(initialRenderCount); // 不重渲染
+
+        // 替换为不同的对象，触发更新
+        act(() => {
+          store.filter = { status: 'inactive', page: 2 };
+        });
+        expect(renderCount).toBeGreaterThan(initialRenderCount);
+        expect(getByText('{"status":"inactive","page":2}')).toBeInTheDocument();
+      });
+
+      test('属性级 equals：为 items 指定 shallowEqual', () => {
+        let renderCount = 0;
+        const store = gfstate(
+          { items: [1, 2, 3] as number[], count: 0 },
+          { equals: { items: shallowEqual } },
+        );
+
+        const App = () => {
+          renderCount++;
+          const { items } = store;
+          return <p>{items.length}</p>;
+        };
+
+        render(<App />);
+        const initialRenderCount = renderCount;
+
+        // items 内容相同，不触发更新
+        act(() => {
+          store.items = [1, 2, 3];
+        });
+        expect(renderCount).toBe(initialRenderCount);
+
+        // 内容不同，触发更新
+        act(() => {
+          store.items = [1, 2, 3, 4];
+        });
+        expect(renderCount).toBeGreaterThan(initialRenderCount);
+      });
+
+      test('deepEqual：深层相等时不触发更新', () => {
+        let renderCount = 0;
+        const store = gfstate(
+          {
+            user: { name: 'alice', meta: { age: 30 } } as {
+              name: string;
+              meta: { age: number };
+            },
+          },
+          { noGfstateKeys: ['user'], equals: deepEqual },
+        );
+
+        const App = () => {
+          renderCount++;
+          const { user } = store;
+          return <p>{user.name}</p>;
+        };
+
+        render(<App />);
+        const initialRenderCount = renderCount;
+
+        // 深层结构相同，不触发更新
+        act(() => {
+          store.user = { name: 'alice', meta: { age: 30 } };
+        });
+        expect(renderCount).toBe(initialRenderCount);
+
+        // 深层值不同，触发更新
+        act(() => {
+          store.user = { name: 'alice', meta: { age: 31 } };
+        });
+        expect(renderCount).toBeGreaterThan(initialRenderCount);
+      });
+
+      test('shallowEqual 工具函数：基本类型', () => {
+        expect(shallowEqual(1, 1)).toBe(true);
+        expect(shallowEqual('a', 'a')).toBe(true);
+        expect(shallowEqual(null, null)).toBe(true);
+        expect(shallowEqual(undefined, undefined)).toBe(true);
+        expect(shallowEqual(1, 2)).toBe(false);
+        expect(shallowEqual(null, undefined)).toBe(false);
+      });
+
+      test('shallowEqual 工具函数：对象', () => {
+        expect(shallowEqual({ a: 1, b: 2 }, { a: 1, b: 2 })).toBe(true);
+        expect(shallowEqual({ a: 1 }, { a: 2 })).toBe(false);
+        expect(shallowEqual({ a: 1, b: 2 }, { a: 1 })).toBe(false);
+        // 嵌套对象使用引用比较
+        const obj = { x: 1 };
+        expect(shallowEqual({ a: obj }, { a: obj })).toBe(true);
+        expect(shallowEqual({ a: { x: 1 } }, { a: { x: 1 } })).toBe(false);
+      });
+
+      test('deepEqual 工具函数：嵌套对象', () => {
+        expect(deepEqual({ a: { b: { c: 1 } } }, { a: { b: { c: 1 } } })).toBe(
+          true,
+        );
+        expect(deepEqual({ a: { b: { c: 1 } } }, { a: { b: { c: 2 } } })).toBe(
+          false,
+        );
+        expect(deepEqual([1, [2, 3]], [1, [2, 3]])).toBe(true);
+        expect(deepEqual([1, [2, 3]], [1, [2, 4]])).toBe(false);
+      });
+    });
+
+    // ============================
+    // enforceActions 严格模式
+    // ============================
+    describe('enforceActions 严格模式', () => {
+      afterEach(() => {
+        // 重置 enforceActions
+        gfstate.config({ enforceActions: false });
+      });
+
+      test('enforceActions 开启后：在 action 外直接赋值抛错', () => {
+        gfstate.config({ enforceActions: true });
+        const store = gfstate({
+          count: 0,
+          inc: () => {
+            store.count += 1;
+          },
+        });
+
+        // action 内修改正常
+        expect(() => store.inc()).not.toThrow();
+        expect(store.count).toBe(1);
+
+        // action 外直接赋值抛错
+        expect(() => {
+          store.count = 99;
+        }).toThrow('enforceActions');
+      });
+
+      test('enforceActions 开启后：action 内嵌套修改正常工作', () => {
+        gfstate.config({ enforceActions: true });
+        const store = gfstate({
+          a: 0,
+          b: 0,
+          setBoth: () => {
+            store.a = 10;
+            store.b = 20;
+          },
+        });
+
+        expect(() => store.setBoth()).not.toThrow();
+        expect(store.a).toBe(10);
+        expect(store.b).toBe(20);
+      });
+
+      test('enforceActions 关闭后：直接赋值正常', () => {
+        gfstate.config({ enforceActions: false });
+        const store = gfstate({ count: 0 });
+
+        expect(() => {
+          store.count = 5;
+        }).not.toThrow();
+        expect(store.count).toBe(5);
+      });
+    });
+
+    // ============================
+    // 嵌套路径 subscribe
+    // ============================
+    describe('嵌套路径 subscribe', () => {
+      test("subscribe('parent.child', cb) 在子 store 属性变化时触发", () => {
+        const store = gfstate({
+          user: {
+            name: 'alice',
+            age: 25,
+          },
+        });
+
+        const calls: Array<[unknown, unknown]> = [];
+        const unsub = store.subscribe('user.name', (newVal, oldVal) => {
+          calls.push([newVal, oldVal]);
+        });
+
+        store.user.name = 'bob';
+        expect(calls).toEqual([['bob', 'alice']]);
+
+        store.user.age = 30; // 不应触发 name 回调
+        expect(calls).toHaveLength(1);
+
+        unsub();
+        store.user.name = 'charlie'; // 取消后不触发
+        expect(calls).toHaveLength(1);
+      });
+
+      test("subscribe('a.b.c', cb) 支持三级嵌套路径", () => {
+        const store = gfstate({
+          org: {
+            dept: {
+              name: 'engineering',
+            },
+          },
+        });
+
+        const calls: Array<[unknown, unknown]> = [];
+        store.subscribe('org.dept.name', (newVal, oldVal) => {
+          calls.push([newVal, oldVal]);
+        });
+
+        store.org.dept.name = 'product';
+        expect(calls).toEqual([['product', 'engineering']]);
+      });
+    });
+
+    // ============================
+    // 嵌套路径 watch
+    // ============================
+    describe('嵌套路径 watch', () => {
+      test("watch: { 'user.name': cb } 在对应属性变化时触发", () => {
+        const calls: Array<[unknown, unknown]> = [];
+
+        const store = gfstate(
+          {
+            user: {
+              name: 'alice',
+              score: 100,
+            },
+          },
+          {
+            watch: {
+              'user.name': (newVal, oldVal) => {
+                calls.push([newVal, oldVal]);
+              },
+            },
+          },
+        );
+
+        store.user.name = 'bob';
+        expect(calls).toEqual([['bob', 'alice']]);
+
+        store.user.score = 200; // 不应触发 name 的 watch
+        expect(calls).toHaveLength(1);
+      });
+
+      test('watch 中嵌套路径与普通 key 可以同时使用', () => {
+        const nameCalls: unknown[] = [];
+        const countCalls: unknown[] = [];
+
+        const store = gfstate(
+          {
+            count: 0,
+            user: { name: 'alice' },
+          },
+          {
+            watch: {
+              count: (newVal) => countCalls.push(newVal),
+              'user.name': (newVal) => nameCalls.push(newVal),
+            },
+          },
+        );
+
+        store.count = 1;
+        store.user.name = 'bob';
+
+        expect(countCalls).toEqual([1]);
+        expect(nameCalls).toEqual(['bob']);
+      });
+    });
+
+    // ============================
+    // computed 循环依赖检测
+    // ============================
+    describe('computed 循环依赖检测', () => {
+      test('computed A 直接依赖自身时抛出循环依赖错误', () => {
+        expect(() => {
+          gfstate(
+            { count: 0 },
+            {
+              computed: {
+                doubled: (s: any) => s.doubled * 2, // 直接循环
+              },
+            },
+          );
+        }).toThrow('循环依赖');
+      });
+
+      test('computed A → B → A 互相依赖时抛出错误并给出链路', () => {
+        expect(() => {
+          gfstate(
+            { x: 1 },
+            {
+              computed: {
+                a: (s: any) => s.b + 1,
+                b: (s: any) => s.a + 1,
+              },
+            },
+          );
+        }).toThrow('循环依赖');
+      });
+
+      test('正常无循环的 computed 不抛错', () => {
+        expect(() => {
+          const store = gfstate(
+            { count: 3 },
+            {
+              computed: {
+                doubled: (s) => s.count * 2,
+                quadrupled: (s: any) => s.doubled * 2, // 依赖另一个 computed
+              },
+            },
+          );
+          // 验证值正确
+          expect(store.doubled).toBe(6);
+          expect(store.quadrupled).toBe(12);
+        }).not.toThrow();
+      });
+    });
+  });
+
+  describe('保留属性名保护', () => {
+    test('reset/destroy/snapshot 不能作为 state key 赋值', () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+      const store = gfstate({ count: 0 });
+
+      (store as any).reset = 'test';
+      expect(typeof store.reset).toBe('function');
+
+      (store as any).destroy = 'test';
+      expect(typeof store.destroy).toBe('function');
+
+      (store as any).snapshot = 'test';
+      expect(typeof store.snapshot).toBe('function');
+
+      expect(warnSpy).toHaveBeenCalledTimes(3);
       warnSpy.mockRestore();
     });
   });

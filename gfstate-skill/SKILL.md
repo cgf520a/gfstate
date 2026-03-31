@@ -1,6 +1,6 @@
 ---
 name: gfstate-skill
-description: Guide for using gfstate, a React fine-grained state management library based on Proxy + useSyncExternalStore. Covers gfstate() for creating reactive stores and useStore() for component-scoped stores. Use this skill whenever the user wants to manage React state with gfstate, create reactive stores, handle fine-grained per-property subscriptions, use Proxy-based state management, or mentions gfstate in any context. Also use when the user is working with React state management and could benefit from per-property reactivity instead of whole-state re-renders.
+description: Guide for using gfstate, a React fine-grained state management library based on Proxy + useSyncExternalStore. Covers gfstate() for creating reactive stores, useStore() for component-scoped stores, and the plugin system (logger, persist, devtools). Use this skill whenever the user wants to manage React state with gfstate, create reactive stores, handle fine-grained per-property subscriptions, use Proxy-based state management, persist state to storage, add logging/devtools to stores, write custom gfstate plugins, or mentions gfstate in any context. Also use when the user is working with React state management and could benefit from per-property reactivity instead of whole-state re-renders.
 ---
 
 # gfstate - React Fine-Grained State Management
@@ -299,6 +299,236 @@ unsub(); // unsubscribe
 
 > `subscribe` is a reserved property name. Nested child store changes use dot-path keys (e.g. `nested.x`).
 
+### `store.reset()` — Reset State to Initial Values
+
+Resets state back to the deep-cloned initial data. Triggers computed recalculation and watch callbacks. Nested child stores are recursively reset.
+
+```tsx
+const store = gfstate({ count: 0, name: 'Alice', nested: { x: 1 } });
+
+store.count = 99;
+store.name = 'Bob';
+store.nested.x = 42;
+
+// Reset all keys to initial values
+store.reset();
+// store.count === 0, store.name === 'Alice', store.nested.x === 1
+
+// Reset a single key
+store.count = 50;
+store.reset('count');
+// store.count === 0, store.name still unchanged
+```
+
+**Rules:**
+
+- `store.reset()` resets all keys to the deep-cloned initial data
+- `store.reset('key')` resets a single key
+- Triggers computed recalculation and watch callbacks
+- Nested child stores are recursively reset
+- No-op if the current value is already equal to the initial value
+- Calling `reset()` on a destroyed store produces a dev warning
+
+### `store.destroy()` — Clean Up Store
+
+Cleans up all subscriptions, watch listeners, and computed listeners. Use this when a store is no longer needed to free resources.
+
+```tsx
+const store = gfstate({ count: 0, nested: { x: 1 } });
+
+// Clean up everything
+store.destroy();
+
+// After destroy: reads/writes produce dev warnings
+store.count; // dev warning
+store.count = 5; // dev warning
+```
+
+**Rules:**
+
+- Recursively destroys nested child stores
+- Marks store as destroyed; subsequent reads/writes produce dev warnings
+- Idempotent — safe to call multiple times
+- After destroy, `reset()` and `snapshot()` also produce dev warnings
+
+### `store.snapshot()` — Deep Clone Current State
+
+Returns a deep-cloned plain JS object of the current store state, with no Proxy. Safe to serialize (e.g., `JSON.stringify`), log, or send over the network.
+
+```tsx
+const store = gfstate(
+  { count: 0, nested: { x: 1 }, ref: { timerId: null } },
+  { computed: { double: (s) => s.count * 2 } },
+);
+
+store.count = 5;
+store.nested.x = 10;
+
+const snap = store.snapshot();
+// snap === { count: 5, nested: { x: 10 }, double: 10, ref: { timerId: null } }
+// snap is a plain object — no Proxy, safe to serialize
+```
+
+**Rules:**
+
+- Includes computed values and nested child store values
+- Includes `ref` values
+- Returned object has no Proxy
+- Returns `{}` if the store is destroyed
+
+> `reset`, `destroy`, and `snapshot` are reserved property names (like `ref` and `subscribe`).
+
+## Plugin System
+
+gfstate has a plugin system for injecting logic at store lifecycle hooks. Plugins can be registered globally (all stores) or per-store. For full details, read `references/gfstate-api.md`.
+
+### Registering Plugins
+
+```tsx
+import { gfstate } from 'gfstate';
+import type { GfstatePlugin } from 'gfstate';
+
+const myPlugin: GfstatePlugin = {
+  name: 'my-plugin',
+  onAfterSet(key, newVal, oldVal, context) {
+    console.log(`[${context.storeName}] ${key}: ${oldVal} → ${newVal}`);
+  },
+};
+
+// Global — affects all stores created after this call
+gfstate.use(myPlugin);
+
+// Per-store — only this store
+const store = gfstate(
+  { count: 0 },
+  { plugins: [myPlugin], storeName: 'counter' },
+);
+```
+
+### Plugin Interface
+
+```typescript
+interface GfstatePlugin {
+  name: string; // unique identifier (deduplication + debugging)
+  onInit?: (ctx: PluginContext) => void | (() => void); // after store creation; return cleanup fn
+  onBeforeSet?: (key, newVal, oldVal, ctx) => void | { value: X } | false; // intercept/replace/cancel
+  onAfterSet?: (key, newVal, oldVal, ctx) => void; // after value is set
+  onSubscribe?: (key: string | null, ctx) => void; // when subscribe() is called
+  onDestroy?: (ctx: PluginContext) => void; // before store cleanup
+}
+
+interface PluginContext {
+  store: any;
+  storeName: string;
+  getSnapshot: () => Record<string, unknown>;
+  getInitialData: () => Record<string, unknown>;
+}
+```
+
+### Built-in Plugins
+
+gfstate ships three ready-to-use plugins, all imported from `'gfstate'`:
+
+#### logger — Console logging
+
+```tsx
+import { gfstate, logger } from 'gfstate';
+
+const store = gfstate(
+  { count: 0, name: 'Alice' },
+  {
+    plugins: [logger({ exclude: ['name'] })],
+    storeName: 'app',
+  },
+);
+// Logs state changes to console with timestamps, grouped by key
+```
+
+Options: `include`, `exclude`, `collapsed` (default true), `logger`, `enabled` (default true), `formatter`, `timestamp` (default true).
+
+#### persist — State persistence
+
+```tsx
+import { gfstate, persist } from 'gfstate';
+
+const store = gfstate(
+  { theme: 'light', fontSize: 14 },
+  {
+    plugins: [
+      persist({
+        key: 'app-settings', // localStorage key (required)
+        include: ['theme'],   // only persist these keys
+        version: 1,           // for migration
+        migrate: (old, v) => v < 1 ? { ...old, fontSize: 14 } : old,
+      }),
+    ],
+  },
+);
+// State auto-saved to localStorage; auto-restored on page load
+```
+
+Options: `key` (required), `storage` (default localStorage), `include`, `exclude`, `version`, `migrate`, `serialize`, `deserialize`, `debounce` (default 100ms), `onRehydrated`.
+
+Supports async storage adapters (e.g., React Native AsyncStorage).
+
+#### devtools — Redux DevTools
+
+```tsx
+import { gfstate, devtools } from 'gfstate';
+
+const store = gfstate(
+  { count: 0 },
+  {
+    plugins: [devtools({ name: 'my-store' })],
+  },
+);
+// Connects to Redux DevTools Extension; supports time travel
+```
+
+Options: `name`, `enabled` (default: dev mode only), `maxAge` (default 50), `actionFormatter`.
+
+### Combining Plugins
+
+```tsx
+import { gfstate, logger, persist, devtools } from 'gfstate';
+
+const store = gfstate(
+  { count: 0, theme: 'light' },
+  {
+    storeName: 'main',
+    plugins: [
+      logger(),
+      persist({ key: 'main-store', include: ['theme'] }),
+      devtools(),
+    ],
+  },
+);
+```
+
+### Writing Custom Plugins
+
+```tsx
+import type { GfstatePlugin } from 'gfstate';
+
+// Example: range validation plugin
+const rangeValidator: GfstatePlugin = {
+  name: 'range-validator',
+  onBeforeSet(key, newVal, oldVal, ctx) {
+    if (key === 'count' && typeof newVal === 'number') {
+      if (newVal < 0) return false; // cancel the set
+      if (newVal > 100) return { value: 100 }; // clamp to max
+    }
+    // return void — no intervention
+  },
+};
+```
+
+**Plugin rules:**
+- Global plugins execute before per-store plugins
+- Same-name plugins are deduplicated (second registration is skipped)
+- `gfstate.clearPlugins()` clears all global plugins (for testing)
+- Plugin errors are caught and logged in dev mode, never propagated
+
 ## useStore() Hook
 
 Creates a component-level store with four namespaces. For full details and examples, read `references/usestore-api.md`.
@@ -370,13 +600,13 @@ const Child: React.FC<{ name: string; onUpdate: () => void }> = (props) => {
 1. **Arrays: NEVER use push/pop/splice** — always replace the full reference
 2. **Do NOT use Symbol values as state** — each access triggers a re-render
 3. **Computed properties are read-only** — assigning throws in dev mode
-4. **`ref` is reserved** — bypasses the reactive system, mutations don't re-render
+4. **`ref`, `subscribe`, `reset`, `destroy`, `snapshot` are reserved** — cannot be used as state keys; `ref` bypasses the reactive system, mutations don't re-render
 5. **Plain objects auto-wrap as child stores** — use `noGfstateKeys` to opt out
 6. **Reading store outside React components** — returns raw data, no subscriptions
 7. **Watch monitors state, computed, and nested child store keys** — use `subscribe()` for external (non-React) listening
 8. **Action references are stable** — safe to pass as props, no `useCallback` needed
 
-## Exported Types
+## Exported Types and Symbols
 
 ```typescript
 import type {
@@ -385,6 +615,26 @@ import type {
   StoreWithComputed, // Store + computed properties
   Options, // gfstate options
   StoreWithStateAndProps, // useStore return type
+  GfstatePlugin, // Plugin interface
+  PluginContext, // Plugin context
+  LoggerOptions, // logger plugin options
+  PersistOptions, // persist plugin options
+  StorageAdapter, // persist storage adapter
+  DevToolsOptions, // devtools plugin options
+} from 'gfstate';
+
+import {
+  gfstate, // core function
+  useStore, // component hook
+  isGfstateStore, // type guard
+  syncWrapper, // sync init helper
+  logger, // built-in logger plugin
+  persist, // built-in persist plugin
+  devtools, // built-in devtools plugin
+  EMPTY_ARRAY, // Shared empty array constant
+  RESET, // Symbol identifier for reset
+  DESTROY, // Symbol identifier for destroy
+  SNAPSHOT, // Symbol identifier for snapshot
 } from 'gfstate';
 ```
 
@@ -392,5 +642,5 @@ import type {
 
 For detailed API signatures, type definitions, and comprehensive examples:
 
-- `references/gfstate-api.md` — Full gfstate() API with all data type behaviors
+- `references/gfstate-api.md` — Full gfstate() API with all data type behaviors, plugin system details, and built-in plugin options
 - `references/usestore-api.md` — Full useStore() API with lifecycle and real-world patterns

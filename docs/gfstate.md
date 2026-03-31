@@ -398,6 +398,92 @@ export default () => {
 };
 ```
 
+### computed 依赖其他 computed
+
+计算属性可以依赖其他计算属性，只需按依赖顺序定义。
+
+```tsx
+import React from 'react';
+import { gfstate } from 'gfstate';
+
+const store = gfstate(
+  {
+    price: 100,
+    quantity: 3,
+    taxRate: 0.1,
+  },
+  {
+    computed: {
+      // subtotal 依赖 state
+      subtotal: (state) => state.price * state.quantity,
+      // tax 依赖 subtotal（另一个 computed）
+      tax: (state) => (state as any).subtotal * state.taxRate,
+      // total 依赖 subtotal 和 tax
+      total: (state) => (state as any).subtotal + (state as any).tax,
+    },
+  },
+);
+
+export default () => {
+  return (
+    <div>
+      <p>单价: {store.price}</p>
+      <p>数量: {store.quantity}</p>
+      <p>税率: {store.taxRate * 100}%</p>
+      <hr />
+      <p>小计: {(store as any).subtotal}</p>
+      <p>税额: {(store as any).tax}</p>
+      <p>总计: {(store as any).total}</p>
+      <hr />
+      <button onClick={() => (store.price += 10)}>单价 +10</button>
+      <button onClick={() => store.quantity++}>数量 +1</button>
+      <button onClick={() => (store.taxRate = 0.2)}>税率改为 20%</button>
+    </div>
+  );
+};
+```
+
+### computed 依赖嵌套子 store
+
+计算属性可以读取嵌套子 store 的属性，依赖会自动追踪。
+
+```tsx
+import React from 'react';
+import { gfstate } from 'gfstate';
+
+const store = gfstate(
+  {
+    user: {
+      firstName: 'John',
+      lastName: 'Doe',
+    },
+    settings: {
+      greeting: 'Hello',
+    },
+  },
+  {
+    computed: {
+      welcomeMessage: (state) =>
+        `${state.settings.greeting}, ${state.user.firstName} ${state.user.lastName}!`,
+    },
+  },
+);
+
+export default () => {
+  return (
+    <div>
+      <p>{(store as any).welcomeMessage}</p>
+      <button onClick={() => (store.user.firstName = 'Jane')}>
+        改名为 Jane
+      </button>
+      <button onClick={() => (store.settings.greeting = 'Hi')}>
+        问候语改为 Hi
+      </button>
+    </div>
+  );
+};
+```
+
 ## watch 监听器
 
 监听指定 state 属性的变化，执行回调。
@@ -446,6 +532,127 @@ export default () => {
       </button>
       <div style={{ marginTop: 8, padding: 8, background: '#f5f5f5' }}>
         <strong>Watch 日志:</strong>
+        {logs.map((log, i) => (
+          <div key={i}>{log}</div>
+        ))}
+      </div>
+    </div>
+  );
+};
+```
+
+### watch 监听 computed 属性
+
+watch 也可以监听计算属性的变化。
+
+```tsx
+import React, { useState } from 'react';
+import { gfstate } from 'gfstate';
+
+const logs: string[] = [];
+
+const store = gfstate(
+  { price: 100, quantity: 3 },
+  {
+    computed: {
+      total: (state) => state.price * state.quantity,
+    },
+    watch: {
+      // 监听 computed 属性
+      total: (newVal, oldVal) => {
+        logs.push(`total: ${oldVal} -> ${newVal}`);
+      },
+    } as any,
+  },
+);
+
+export default () => {
+  const [, forceUpdate] = useState(0);
+  return (
+    <div>
+      <p>price: {store.price}</p>
+      <p>quantity: {store.quantity}</p>
+      <p>total: {(store as any).total}</p>
+      <button
+        onClick={() => {
+          store.price += 10;
+          forceUpdate((v) => v + 1);
+        }}
+      >
+        价格 +10
+      </button>
+      <button
+        onClick={() => {
+          store.quantity++;
+          forceUpdate((v) => v + 1);
+        }}
+      >
+        数量 +1
+      </button>
+      <div style={{ marginTop: 8, padding: 8, background: '#f5f5f5' }}>
+        <strong>Watch total 变化日志:</strong>
+        {logs.map((log, i) => (
+          <div key={i}>{log}</div>
+        ))}
+      </div>
+    </div>
+  );
+};
+```
+
+### watch 监听嵌套子 store
+
+watch 可以监听嵌套子 store 的属性变化。
+
+```tsx
+import React, { useState } from 'react';
+import { gfstate } from 'gfstate';
+
+const logs: string[] = [];
+
+const store = gfstate(
+  {
+    user: {
+      name: 'Alice',
+      age: 25,
+    },
+  },
+  {
+    watch: {
+      // 监听嵌套子 store key
+      user: (newVal, oldVal) => {
+        logs.push(
+          `user 变化: ${JSON.stringify(oldVal)} -> ${JSON.stringify(newVal)}`,
+        );
+      },
+    },
+  },
+);
+
+export default () => {
+  const [, forceUpdate] = useState(0);
+  return (
+    <div>
+      <p>name: {store.user.name}</p>
+      <p>age: {store.user.age}</p>
+      <button
+        onClick={() => {
+          store.user.name = 'Bob';
+          forceUpdate((v) => v + 1);
+        }}
+      >
+        改名
+      </button>
+      <button
+        onClick={() => {
+          store.user.age++;
+          forceUpdate((v) => v + 1);
+        }}
+      >
+        年龄 +1
+      </button>
+      <div style={{ marginTop: 8, padding: 8, background: '#f5f5f5' }}>
+        <strong>Watch user 日志:</strong>
         {logs.map((log, i) => (
           <div key={i}>{log}</div>
         ))}

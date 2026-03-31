@@ -73,4 +73,6 @@ export default () => {
 
 - [gfstate 核心 API](/gfstate) — 全局 store 的完整用法和示例
 - [useStore Hook](/use-store) — 组件级 store 的完整用法和示例
+- [reset / destroy / snapshot](/reset-destroy-snapshot) — 状态重置、销毁和快照
+- [插件系统](/plugins) — logger、persist、devtools 及自定义插件
 - [API 参考](/api) — 完整的类型签名和参数说明
