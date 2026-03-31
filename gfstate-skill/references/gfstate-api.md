@@ -58,7 +58,8 @@ const store = gfstate(
 
 - Read-only — assigning to a computed property throws in development mode
 - Dependencies are auto-tracked via a lightweight Proxy during first evaluation
-- Cannot depend on other computed properties or nested child store properties
+- Supports depending on other computed properties (must be defined in dependency order) and nested child store properties
+- Dynamic dependency re-subscription: if a computed conditionally reads different keys, new dependencies are automatically subscribed on recompute
 - If a dependency key conflicts with a state key, a warning is logged in dev mode
 
 ### watch
@@ -85,7 +86,7 @@ const store = gfstate(
 **Rules:**
 
 - Only fires when value actually changes (referential equality `===`)
-- Only monitors direct state properties (not computed, not nested child store keys)
+- Monitors state properties, computed properties, and nested child store keys
 - Watching a non-existent key logs a warning in dev mode
 - Errors in watch callbacks are caught and logged, not propagated
 
@@ -221,6 +222,51 @@ isGfstateStore(store); // true
 isGfstateStore({}); // false
 isGfstateStore(store.nested); // true (if nested is a plain object)
 ```
+
+## store.subscribe() — External Subscription
+
+Subscribe to store changes from outside React components. Supports state, computed, and nested child store changes.
+
+```typescript
+type SubscribeFn = {
+  (cb: (key: string, newVal: unknown, oldVal: unknown) => void): () => void;
+  (key: string, cb: (newVal: unknown, oldVal: unknown) => void): () => void;
+};
+```
+
+### Listen to all changes
+
+```tsx
+const store = gfstate({ count: 0, nested: { x: 1 } }, {
+  computed: { double: (s) => s.count * 2 },
+});
+
+const unsub = store.subscribe((key, newVal, oldVal) => {
+  console.log(`${key}: ${oldVal} → ${newVal}`);
+});
+
+store.count = 1; // logs "count: 0 → 1" and "double: 0 → 2"
+store.nested.x = 2; // logs "nested.x: 1 → 2"
+
+unsub(); // unsubscribe
+```
+
+### Listen to a specific key
+
+```tsx
+store.subscribe('count', (newVal, oldVal) => {
+  console.log(`count: ${oldVal} → ${newVal}`);
+});
+
+// Nested child store changes use dot-path keys
+store.subscribe('nested.x', (newVal, oldVal) => { ... });
+```
+
+**Rules:**
+
+- `subscribe` is a reserved property name — cannot be used as a state key
+- Returns an unsubscribe function
+- Nested child store changes use dot-notation key path (e.g. `nested.x`)
 
 ## Core Types
 

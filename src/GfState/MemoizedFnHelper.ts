@@ -1,6 +1,6 @@
 class MemoizedFnHelper {
-  impl: Function;
-  constructor(initialFn: Function) {
+  private impl: (...args: any[]) => any;
+  constructor(initialFn: (...args: any[]) => any) {
     // 1. 内部保存当前的实现
     this.impl = initialFn;
 
@@ -10,7 +10,7 @@ class MemoizedFnHelper {
   }
 
   // 更新内核：当业务逻辑变化时，调用此方法更新
-  update(newFn: Function) {
+  update(newFn: (...args: any[]) => any) {
     this.impl = newFn;
   }
 

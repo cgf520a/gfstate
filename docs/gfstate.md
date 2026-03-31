@@ -747,3 +747,114 @@ export default () => {
   );
 };
 ```
+
+## subscribe 外部订阅
+
+`store.subscribe()` 可以在组件外部监听 store 变更，支持监听所有变更或指定属性。返回取消订阅函数。
+
+### 监听所有变更
+
+```tsx
+import React, { useState } from 'react';
+import { gfstate } from 'gfstate';
+
+const logs: string[] = [];
+
+const store = gfstate(
+  {
+    count: 0,
+    nested: { x: 1 },
+  },
+  {
+    computed: {
+      double: (s) => s.count * 2,
+    },
+  },
+);
+
+// 监听所有变更（包括 state、computed、嵌套子 store）
+const unsub = store.subscribe((key, newVal, oldVal) => {
+  logs.push(`${key}: ${JSON.stringify(oldVal)} → ${JSON.stringify(newVal)}`);
+});
+
+export default () => {
+  const [, forceUpdate] = useState(0);
+  return (
+    <div>
+      <p>count: {store.count}</p>
+      <p>double: {(store as any).double}</p>
+      <p>nested.x: {store.nested.x}</p>
+      <button
+        onClick={() => {
+          store.count++;
+          forceUpdate((v) => v + 1);
+        }}
+      >
+        count +1
+      </button>
+      <button
+        onClick={() => {
+          store.nested.x++;
+          forceUpdate((v) => v + 1);
+        }}
+      >
+        nested.x +1
+      </button>
+      <div style={{ marginTop: 8, padding: 8, background: '#f5f5f5' }}>
+        <strong>Subscribe 日志:</strong>
+        {logs.map((log, i) => (
+          <div key={i}>{log}</div>
+        ))}
+      </div>
+    </div>
+  );
+};
+```
+
+### 监听特定属性
+
+```tsx
+import React, { useState } from 'react';
+import { gfstate } from 'gfstate';
+
+const countLogs: string[] = [];
+
+const store = gfstate({ count: 0, name: 'Alice' });
+
+// 只监听 count 变更
+store.subscribe('count', (newVal, oldVal) => {
+  countLogs.push(`count: ${oldVal} → ${newVal}`);
+});
+
+export default () => {
+  const [, forceUpdate] = useState(0);
+  return (
+    <div>
+      <p>count: {store.count}</p>
+      <p>name: {store.name}</p>
+      <button
+        onClick={() => {
+          store.count++;
+          forceUpdate((v) => v + 1);
+        }}
+      >
+        count +1
+      </button>
+      <button
+        onClick={() => {
+          store.name = 'Bob';
+          forceUpdate((v) => v + 1);
+        }}
+      >
+        改名（不触发 count 订阅）
+      </button>
+      <div style={{ marginTop: 8, padding: 8, background: '#f5f5f5' }}>
+        <strong>Count 订阅日志:</strong>
+        {countLogs.map((log, i) => (
+          <div key={i}>{log}</div>
+        ))}
+      </div>
+    </div>
+  );
+};
+```

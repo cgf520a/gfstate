@@ -58,7 +58,8 @@ docs/                         # dumi v2 文档（中文）
 - **嵌套对象**: 纯对象自动递归包装为子 gfstate store
 - **数组**: 引用比较（必须替换整个数组引用才触发更新）
 - **更新方式**: `store.key = val` | `store('key', val)` | `store({...})` | `store(prev => partial)`
-- **Options**: `computed`（计算属性）、`watch`（监听）、`created`（生命周期）、`noGfstateKeys`（排除自动包装的 key）
+- **Options**: `computed`（计算属性，支持依赖其他 computed 和嵌套子 store）、`watch`（监听 state/computed/嵌套子 store key）、`created`（生命周期）、`noGfstateKeys`（排除自动包装的 key）
+- **外部订阅**: `store.subscribe(cb)` 监听所有变更（含 computed 和嵌套子 store），`store.subscribe('key', cb)` 监听特定 key
 - **静态方法**: `gfstate.config({ batch })` 配置批量更新
 
 ### 2. `useStore({ state, props, action, ref, lifecycle, options })` — 组件级 Store
@@ -102,19 +103,9 @@ docs/                         # dumi v2 文档（中文）
 - 数组不能用 push/pop/splice — 必须替换整个引用: `store.items = [...store.items, newItem]`
 - 不要用 Symbol 值作为 state（每次访问都会触发重渲染）
 - computed 属性是只读的，赋值在开发模式下会抛错
-- `ref` 是保留属性名，绕过响应式系统（不代理、不触发更新）
+- `ref` 和 `subscribe` 是保留属性名，绕过响应式系统
 - 纯对象自动包装为子 store，除非列在 `noGfstateKeys` 中
 - 在组件外读取 store 属性会走 fallback 路径（直接返回原始数据，不触发订阅）
-
-## Skills
-
-### 开发者技能（`.claude/skills/`）
-
-- `run-tests.md` — 运行测试
-- `build-library.md` — 构建库和文档站
-- `add-feature.md` — 添加新功能
-- `write-documentation.md` — 编写文档
-- `debug-and-troubleshoot.md` — 调试排错
 
 ### 使用方技能（`gfstate-skill/`）
 
@@ -123,3 +114,4 @@ docs/                         # dumi v2 文档（中文）
 - `gfstate-skill/SKILL.md` — 主技能文件（安装、快速开始、核心 API、注意事项）
 - `gfstate-skill/references/gfstate-api.md` — gfstate() 完整 API 参考
 - `gfstate-skill/references/usestore-api.md` — useStore() 完整 API 参考
+- 每次更新功能都需要更新该技能

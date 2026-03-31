@@ -710,4 +710,129 @@ describe('useStore', () => {
     fireEvent.click(getByText('change'));
     expect(getByText('result:3')).toBeInTheDocument();
   });
+
+  // ========== 补全测试覆盖 ==========
+
+  it('React.StrictMode 下 beforeCreate 每次挂载执行一次', () => {
+    let callCount = 0;
+    const App = () => {
+      useStore({
+        state: { count: 0 },
+        lifecycle: {
+          beforeCreate() {
+            callCount++;
+          },
+        },
+      });
+      return <div>ok</div>;
+    };
+
+    render(
+      <React.StrictMode>
+        <App />
+      </React.StrictMode>,
+    );
+
+    // React 18 StrictMode 开发模式下会卸载并重新挂载组件，
+    // 每次挂载都会创建新的 useRef，因此 beforeCreate 被调用 2 次
+    expect(callCount).toBe(2);
+  });
+
+  it('useStore({}) 创建空 store 不报错', () => {
+    const App = () => {
+      const store = useStore({});
+      return <div>has-state:{String(!!store.state)}</div>;
+    };
+    const { getByText } = render(<App />);
+    expect(getByText(/has-state:true/)).toBeInTheDocument();
+  });
+
+  it('action 调用另一个 action', () => {
+    let storeRef: any;
+    const App = () => {
+      const store = useStore({
+        state: { count: 0 },
+        action: {
+          increment() {
+            storeRef.state.count = (storeRef.state.count as number) + 1;
+          },
+          incrementTwice() {
+            storeRef.action.increment();
+            storeRef.action.increment();
+          },
+        },
+      });
+      storeRef = store;
+      const { count } = store.state;
+      return (
+        <>
+          <p>{count as number}</p>
+          <button onClick={store.action.incrementTwice}>double</button>
+        </>
+      );
+    };
+    const { getByText } = render(<App />);
+    expect(getByText('0')).toBeInTheDocument();
+
+    fireEvent.click(getByText('double'));
+    expect(getByText('2')).toBeInTheDocument();
+  });
+
+  it('action 抛错不破坏 store 状态', () => {
+    let storeRef: any;
+    const App = () => {
+      const store = useStore({
+        state: { count: 0 },
+        action: {
+          badAction() {
+            storeRef.state.count = 10;
+            throw new Error('boom');
+          },
+        },
+      });
+      storeRef = store;
+      const { count } = store.state;
+      return (
+        <>
+          <p>{count as number}</p>
+          <button
+            onClick={() => {
+              try {
+                store.action.badAction();
+              } catch {
+                // 忽略错误
+              }
+            }}
+          >
+            bad
+          </button>
+        </>
+      );
+    };
+    const { getByText } = render(<App />);
+    fireEvent.click(getByText('bad'));
+    expect(getByText('10')).toBeInTheDocument();
+  });
+
+  it('useStore computed 依赖 state', () => {
+    const App = () => {
+      const store = useStore({
+        state: { count: 2 },
+        options: {
+          computed: {
+            doubled: (s: Record<string, unknown>) => (s.count as number) * 2,
+          },
+        },
+      });
+      const doubled = (store.state as any).doubled;
+      const { count } = store.state;
+      return (
+        <p>
+          {count as number}x2={doubled}
+        </p>
+      );
+    };
+    const { getByText } = render(<App />);
+    expect(getByText('2x2=4')).toBeInTheDocument();
+  });
 });

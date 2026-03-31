@@ -58,4 +58,27 @@ describe('MemoizedFnHelper', () => {
     // 在严格模式下，this 应为 null；在非严格模式下，可能是 globalThis
     expect(capturedThis === null || capturedThis === globalThis).toBe(true);
   });
+
+  test('run 返回各种类型的值', () => {
+    const helper = new MemoizedFnHelper(() => undefined);
+    expect(helper.run()).toBeUndefined();
+
+    helper.update(() => null);
+    expect(helper.run()).toBeNull();
+
+    const obj = { a: 1 };
+    helper.update(() => obj);
+    expect(helper.run()).toBe(obj);
+
+    helper.update(() => 42);
+    expect(helper.run()).toBe(42);
+
+    helper.update(() => '');
+    expect(helper.run()).toBe('');
+  });
+
+  test('无参数调用 run', () => {
+    const helper = new MemoizedFnHelper(() => 'no-args');
+    expect(helper.run()).toBe('no-args');
+  });
 });

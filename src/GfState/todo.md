@@ -43,3 +43,41 @@
    低 中间件/插件系统 仅有 batch config，无 persist/logger
    低 DevTools 完全未实现
    低 SSR/RSC 专项支持 仅有基本 getServerSnapshot
+
+---
+
+## 设计决策记录（2026-03-31）
+
+### 已决策
+
+- **onChange 回调**：不需要额外提供，组件内状态变更自动触发 re-render。现有 `watch` 满足需求，但需扩展支持 computed 和嵌套 key
+- **异步状态**：当前 `created` / `mounted` 异步模式已够用，计划提供 `gfstate.fromAsync()` 便利工具
+- **Suspense**：中低优先级，分阶段实现。近期提供 `gfstate.suspense()` 兼容 React 19 `use()`
+- **选项式 vs 组合式**：保持选项式 API，组合能力通过多 store 实例天然实现
+- **全局 Provider**：不提供，由用户使用 React Context 自行处理
+- **子级 Context**：不提供，子级传递对象自动应用 gfstate
+
+### 功能扩展路线图
+
+#### Phase 1 — 核心补齐（v0.1.0）
+
+- [x] 外部订阅 API: `store.subscribe(cb): unsubscribe`
+- [x] computed 依赖 computed（修复 `subscribeToDepKey` 仅检查 state 的限制）
+- [x] watch 扩展：支持 computed 属性和嵌套子 store key
+
+#### Phase 2 — 中间件/插件系统（v0.2.0）
+
+- [ ] 插件 API: `gfstate.use(plugin)` / `options.plugins`
+- [ ] persist 插件: 状态持久化
+- [ ] logger 插件: 开发环境状态变更日志
+
+#### Phase 3 — DX 提升（v0.3.0）
+
+- [ ] `gfstate.fromAsync()` 异步状态辅助工具
+- [ ] DevTools: 接入 Redux DevTools Extension
+- [ ] 测试工具: `createMockStore()`、`resetStore()`、`getStoreSnapshot()`
+
+#### Phase 4 — 现代 React 支持（v0.4.0）
+
+- [ ] SSR/Hydration: 差异化 `getServerSnapshot`、`gfstate.hydrate()`
+- [ ] Suspense/use(): `gfstate.suspense(asyncFn)` 兼容 React 19

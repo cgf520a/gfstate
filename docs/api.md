@@ -64,7 +64,7 @@ interface Options<Data, ExcludeKeys, Computed> {
 
 - **类型**: `Record<string, (state: Data) => any>`
 - **可选**: 是
-- **描述**: 计算属性。每个属性是一个函数，接收 state，返回计算值。计算属性只读，自动缓存，依赖变化时重新计算。
+- **描述**: 计算属性。每个属性是一个函数，接收 state，返回计算值。计算属性只读，自动缓存，依赖变化时重新计算。支持依赖其他 computed 属性和嵌套子 store 属性（需按依赖顺序定义）。
 
 ```typescript
 const store = gfstate(
@@ -80,9 +80,9 @@ console.log(store.fullName); // "John Doe"
 
 ##### options.watch
 
-- **类型**: `Partial<Record<keyof Data, (newVal: any, oldVal: any, store: any) => void>>`
+- **类型**: `Partial<Record<keyof Data | keyof Computed, (newVal: any, oldVal: any, store: any) => void>>`
 - **可选**: 是
-- **描述**: 监听器。当指定的状态属性值变化时执行回调。
+- **描述**: 监听器。当指定的属性值变化时执行回调。支持监听 state 属性、computed 计算属性和嵌套子 store key。
 
 ```typescript
 const store = gfstate(
@@ -210,6 +210,48 @@ const store = gfstate({
 
 store.increment(); // count 变为 1
 ```
+
+### 订阅变更
+
+`store.subscribe()` 可以在组件外部监听 store 变更，支持 state、computed 和嵌套子 store 的变更。
+
+```typescript
+// 签名
+type SubscribeFn = {
+  (cb: (key: string, newVal: unknown, oldVal: unknown) => void): () => void;
+  (key: string, cb: (newVal: unknown, oldVal: unknown) => void): () => void;
+};
+```
+
+#### 监听所有变更
+
+```typescript
+const store = gfstate({ count: 0, nested: { x: 1 } });
+
+const unsubscribe = store.subscribe((key, newVal, oldVal) => {
+  console.log(`${key}: ${oldVal} → ${newVal}`);
+});
+
+store.count = 1; // 输出: "count: 0 → 1"
+store.nested.x = 2; // 输出: "nested.x: 1 → 2"
+
+unsubscribe(); // 取消订阅
+```
+
+#### 监听特定属性
+
+```typescript
+const store = gfstate({ count: 0, name: 'Alice' });
+
+const unsubscribe = store.subscribe('count', (newVal, oldVal) => {
+  console.log(`count: ${oldVal} → ${newVal}`);
+});
+
+store.count = 1; // 输出: "count: 0 → 1"
+store.name = 'Bob'; // 不触发回调
+```
+
+> **注意**: `subscribe` 是保留属性名，不能作为 state key 使用。嵌套子 store 变更的 key 使用点号路径格式（如 `nested.x`）。
 
 ## gfstate.config()
 
@@ -447,10 +489,10 @@ type TransformData<Data, ExcludeKeys> = {
 type StoreWithComputed<Data, ExcludeKeys, Computed> = Store<
   TransformData<Data, ExcludeKeys>
 > &
-  ComputedValues<Computed>;
+  ComputedValues<Computed> & { subscribe: SubscribeFn };
 ```
 
-包含计算属性的 Store 类型。
+包含计算属性和 subscribe 方法的 Store 类型。
 
 ### StoreWithStateAndProps<State, Props, Action, Ref, ExcludeKeys>
 

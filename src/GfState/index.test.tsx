@@ -1684,37 +1684,44 @@ describe('GfState', () => {
       expect(getByText('b:200')).toBeInTheDocument();
     });
 
-    test('computed 依赖另一个 computed 不自动更新（已知限制）', () => {
-      // 这个测试仅文档化限制行为
-      let compute2Called = false;
-
+    test('computed 依赖另一个 computed 自动更新', () => {
       const store = gfstate(
         { count: 0 },
         {
           computed: {
             double: (s) => s.count * 2,
             quad: (s) => {
-              compute2Called = true;
-              return (s as any).double * 2; // 试图读取另一个 computed
+              return (s as any).double * 2;
             },
           },
         },
       );
 
-      const value = (store as any).quad;
-      // double 依赖被计算，但 quad 在初始化时计算时，double 尚未计算完毕
-      // 多次访问不会更新 quad 的缓存值，因为 double 在 computeds 中，不在 state 中
-      expect(compute2Called).toBe(true);
+      const App = () => {
+        const quad = (store as any).quad;
+        return (
+          <>
+            <p>quad:{quad}</p>
+            <button onClick={() => (store.count = 3)}>set 3</button>
+          </>
+        );
+      };
+
+      const { getByText } = render(<App />);
+      expect(getByText('quad:0')).toBeInTheDocument();
+
+      fireEvent.click(getByText('set 3'));
+      expect(getByText('quad:12')).toBeInTheDocument(); // 3 * 2 * 2 = 12
     });
 
-    test('computed 依赖嵌套 gfstate 子 store 不自动更新（已知限制）', () => {
+    test('computed 依赖嵌套 gfstate 子 store 自动更新', () => {
       const store = gfstate(
         {
           nested: { x: 1 },
         },
         {
           computed: {
-            computed_x: (s) => (s.nested as any).x * 10, // 读取嵌套对象
+            computed_x: (s) => (s.nested as any).x * 10,
           },
         },
       );
@@ -1734,31 +1741,36 @@ describe('GfState', () => {
       const { getByText } = render(<App />);
       expect(getByText('computed:10')).toBeInTheDocument();
 
-      // 更新嵌套值，computed 不会自动重新计算（已知限制）
       fireEvent.click(getByText('update nested'));
-      // computed 缓存值保持不变
-      expect(getByText('computed:10')).toBeInTheDocument();
+      expect(getByText('computed:50')).toBeInTheDocument(); // 5 * 10 = 50
     });
 
-    test('watch 对 gfstate 嵌套 key 发出警告（已知限制）', () => {
-      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    test('watch 监听嵌套 gfstate 子 store 属性变更', () => {
+      const changes: Array<{ newVal: unknown; oldVal: unknown }> = [];
 
       const store = gfstate(
         {
-          nested: { x: 1 },
+          nested: { x: 1, y: 2 },
         },
         {
           watch: {
-            nested: () => {},
+            nested: (newVal: unknown, oldVal: unknown) => {
+              changes.push({ newVal, oldVal });
+            },
           } as any,
         },
       );
 
-      expect(warnSpy).toHaveBeenCalledWith(
-        expect.stringMatching(/nested.*不存在于 state/),
-      );
+      // 修改嵌套子 store 的属性
+      (store.nested as any).x = 10;
 
-      warnSpy.mockRestore();
+      expect(changes).toHaveLength(1);
+      expect(changes[0]).toEqual({ newVal: 10, oldVal: 1 });
+
+      // 修改另一个嵌套属性
+      (store.nested as any).y = 20;
+      expect(changes).toHaveLength(2);
+      expect(changes[1]).toEqual({ newVal: 20, oldVal: 2 });
     });
 
     test('watch 回调抛错时不应中断其他订阅者', () => {
@@ -2064,6 +2076,362 @@ describe('GfState', () => {
 
       // 卸载组件（触发 unsubscribe lambda）
       unmount();
+    });
+
+    // ========== subscribe 外部订阅 API 测试 ==========
+
+    test('store.subscribe 监听所有变更', () => {
+      const store = gfstate({ count: 0, name: 'hello' });
+      const changes: Array<{ key: string; newVal: unknown; oldVal: unknown }> =
+        [];
+
+      store.subscribe((key, newVal, oldVal) => {
+        changes.push({ key, newVal, oldVal });
+      });
+
+      store.count = 1;
+      store.name = 'world';
+
+      expect(changes).toEqual([
+        { key: 'count', newVal: 1, oldVal: 0 },
+        { key: 'name', newVal: 'world', oldVal: 'hello' },
+      ]);
+    });
+
+    test('store.subscribe 监听特定 key 变更', () => {
+      const store = gfstate({ count: 0, name: 'hello' });
+      const countChanges: Array<{ newVal: unknown; oldVal: unknown }> = [];
+
+      store.subscribe('count', (newVal, oldVal) => {
+        countChanges.push({ newVal, oldVal });
+      });
+
+      store.count = 1;
+      store.name = 'world'; // 不触发 count 订阅
+
+      expect(countChanges).toEqual([{ newVal: 1, oldVal: 0 }]);
+    });
+
+    test('store.subscribe 取消订阅', () => {
+      const store = gfstate({ count: 0 });
+      const changes: unknown[] = [];
+
+      const unsubscribe = store.subscribe((key, newVal) => {
+        changes.push(newVal);
+      });
+
+      store.count = 1;
+      unsubscribe();
+      store.count = 2;
+
+      expect(changes).toEqual([1]);
+    });
+
+    test('store.subscribe 监听 computed 变更', () => {
+      const store = gfstate(
+        { count: 0 },
+        {
+          computed: {
+            double: (s) => s.count * 2,
+          },
+        },
+      );
+      const changes: Array<{ key: string; newVal: unknown; oldVal: unknown }> =
+        [];
+
+      store.subscribe((key, newVal, oldVal) => {
+        changes.push({ key, newVal, oldVal });
+      });
+
+      store.count = 5;
+
+      // 应收到 count 变更和 double computed 变更
+      expect(changes).toContainEqual({
+        key: 'count',
+        newVal: 5,
+        oldVal: 0,
+      });
+      expect(changes).toContainEqual({
+        key: 'double',
+        newVal: 10,
+        oldVal: 0,
+      });
+    });
+
+    test('store.subscribe 监听嵌套子 store 变更', () => {
+      const store = gfstate({ nested: { x: 1, y: 2 } });
+      const changes: Array<{ key: string; newVal: unknown; oldVal: unknown }> =
+        [];
+
+      store.subscribe((key, newVal, oldVal) => {
+        changes.push({ key, newVal, oldVal });
+      });
+
+      (store.nested as any).x = 10;
+
+      expect(changes).toContainEqual({
+        key: 'nested.x',
+        newVal: 10,
+        oldVal: 1,
+      });
+    });
+
+    test('store.subscribe 按 key 订阅嵌套子 store 变更', () => {
+      const store = gfstate({ nested: { x: 1, y: 2 } });
+      const changes: Array<{ newVal: unknown; oldVal: unknown }> = [];
+
+      store.subscribe('nested.x', (newVal, oldVal) => {
+        changes.push({ newVal, oldVal });
+      });
+
+      (store.nested as any).x = 10;
+      (store.nested as any).y = 20; // 不触发 nested.x 订阅
+
+      expect(changes).toEqual([{ newVal: 10, oldVal: 1 }]);
+    });
+
+    test('subscribe 是保留属性名，不能作为 state key', () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+      const store = gfstate({ count: 0 });
+      (store as any).subscribe = 'test';
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringMatching(/subscribe.*保留属性名/),
+      );
+      // subscribe 仍然是函数
+      expect(typeof store.subscribe).toBe('function');
+
+      warnSpy.mockRestore();
+    });
+
+    // ========== computed 动态依赖测试 ==========
+
+    test('computed 动态依赖切换时正确更新', () => {
+      const store = gfstate(
+        { flag: true, a: 10, b: 20 },
+        {
+          computed: {
+            result: (s) => (s.flag ? s.a : s.b),
+          },
+        },
+      );
+
+      const App = () => {
+        const result = (store as any).result;
+        return (
+          <>
+            <p>result:{result}</p>
+            <button onClick={() => (store.flag = false)}>switch</button>
+            <button onClick={() => (store.b = 99)}>set b</button>
+          </>
+        );
+      };
+
+      const { getByText } = render(<App />);
+      expect(getByText('result:10')).toBeInTheDocument(); // flag=true, reads a
+
+      fireEvent.click(getByText('switch'));
+      expect(getByText('result:20')).toBeInTheDocument(); // flag=false, reads b
+
+      fireEvent.click(getByText('set b'));
+      expect(getByText('result:99')).toBeInTheDocument(); // b changed, should update
+    });
+
+    // ========== watch 扩展测试 ==========
+
+    test('watch 监听计算属性变更', () => {
+      const changes: Array<{ newVal: unknown; oldVal: unknown }> = [];
+
+      const store = gfstate(
+        { count: 0 },
+        {
+          computed: {
+            double: (s) => s.count * 2,
+          },
+          watch: {
+            double: (newVal: unknown, oldVal: unknown) => {
+              changes.push({ newVal, oldVal });
+            },
+          } as any,
+        },
+      );
+
+      store.count = 5;
+      expect(changes).toHaveLength(1);
+      expect(changes[0]).toEqual({ newVal: 10, oldVal: 0 });
+
+      // 设置相同值不触发 watch
+      store.count = 5;
+      expect(changes).toHaveLength(1);
+    });
+  });
+
+  // ========== 补全测试覆盖 ==========
+
+  describe('subscribe 健壮性', () => {
+    test('store.subscribe 回调抛错不影响其他监听者', () => {
+      const store = gfstate({ count: 0 });
+      const errorSpy = jest
+        .spyOn(console, 'error')
+        .mockImplementation(() => {});
+      const values: unknown[] = [];
+
+      store.subscribe(() => {
+        throw new Error('boom');
+      });
+      store.subscribe((_key: string, newVal: unknown) => {
+        values.push(newVal);
+      });
+
+      store.count = 1;
+      expect(values).toEqual([1]);
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('回调执行出错'),
+        expect.any(Error),
+      );
+      errorSpy.mockRestore();
+    });
+
+    test('store.subscribe 注册多个回调和重复注册', () => {
+      const store = gfstate({ count: 0 });
+      const results1: unknown[] = [];
+      const results2: unknown[] = [];
+
+      const cb = (_key: string, newVal: unknown) => results1.push(newVal);
+      store.subscribe(cb);
+      store.subscribe(cb); // Set 去重，不会重复添加
+      store.subscribe((_key: string, newVal: unknown) =>
+        results2.push(newVal),
+      );
+
+      store.count = 1;
+      // cb 在 Set 中只有一份
+      expect(results1).toEqual([1]);
+      expect(results2).toEqual([1]);
+    });
+
+    test('store("subscribe", val) 应发出警告', () => {
+      const warnSpy = jest
+        .spyOn(console, 'warn')
+        .mockImplementation(() => {});
+      const store = gfstate({ count: 0 });
+      store('subscribe' as any, 'test');
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('subscribe'),
+      );
+      warnSpy.mockRestore();
+    });
+  });
+
+  describe('Function 原型属性冲突', () => {
+    test('store 可以使用 name 和 length 作为 state key', () => {
+      const store = gfstate({ name: 'hello', length: 42 });
+      const App = () => {
+        const name = store.name as string;
+        const length = store.length as number;
+        return (
+          <p>
+            {name}:{length}
+          </p>
+        );
+      };
+      const { getByText } = render(<App />);
+      expect(getByText('hello:42')).toBeInTheDocument();
+
+      act(() => {
+        store.name = 'world';
+      });
+      expect(getByText('world:42')).toBeInTheDocument();
+    });
+  });
+
+  describe('isGfstateStore 边界情况', () => {
+    test('各种非 store 类型返回 false', () => {
+      expect(isGfstateStore(null)).toBe(false);
+      expect(isGfstateStore(undefined)).toBe(false);
+      expect(isGfstateStore(42)).toBe(false);
+      expect(isGfstateStore('string')).toBe(false);
+      expect(isGfstateStore({})).toBe(false);
+      expect(isGfstateStore([])).toBe(false);
+      expect(isGfstateStore(() => {})).toBe(false);
+    });
+
+    test('gfstate store 返回 true', () => {
+      const store = gfstate({ x: 1 });
+      expect(isGfstateStore(store)).toBe(true);
+    });
+  });
+
+  describe('isPlainObject 边界情况', () => {
+    test('基本类型返回 false', () => {
+      expect(isPlainObject(null)).toBe(false);
+      expect(isPlainObject(undefined)).toBe(false);
+      expect(isPlainObject(42)).toBe(false);
+      expect(isPlainObject('str')).toBe(false);
+      expect(isPlainObject(true)).toBe(false);
+    });
+
+    test('非纯对象返回 false', () => {
+      expect(isPlainObject([])).toBe(false);
+      expect(isPlainObject(() => {})).toBe(false);
+      expect(isPlainObject(new Date())).toBe(false);
+      expect(isPlainObject(new Map())).toBe(false);
+      expect(isPlainObject(new Set())).toBe(false);
+      expect(isPlainObject(/regex/)).toBe(false);
+
+      class Foo {}
+      expect(isPlainObject(new Foo())).toBe(false);
+    });
+
+    test('纯对象返回 true', () => {
+      expect(isPlainObject({})).toBe(true);
+      expect(isPlainObject(Object.create(null))).toBe(true);
+      expect(isPlainObject(Object.create(Object.prototype))).toBe(true);
+      expect(isPlainObject({ a: 1, b: 2 })).toBe(true);
+    });
+  });
+
+  describe('Proxy trap 测试', () => {
+    test('getOwnPropertyDescriptor 返回正确的描述符', () => {
+      const store = gfstate(
+        { count: 0 },
+        { computed: { double: (s) => s.count * 2 } },
+      );
+
+      const desc = Object.getOwnPropertyDescriptor(store, 'count');
+      expect(desc).toBeDefined();
+      expect(desc!.configurable).toBe(true);
+      expect(desc!.enumerable).toBe(true);
+      expect(desc!.value).toBe(0);
+
+      const computedDesc = Object.getOwnPropertyDescriptor(store, 'double');
+      expect(computedDesc).toBeDefined();
+      expect(computedDesc!.value).toBe(0);
+    });
+
+    test('Object.keys 不包含 prototype', () => {
+      const store = gfstate({ a: 1, b: 'hello' });
+      const keys = Object.keys(store);
+      expect(keys).not.toContain('prototype');
+      expect(keys).toContain('a');
+      expect(keys).toContain('b');
+    });
+  });
+
+  describe('watch 边界', () => {
+    test('watch 监听 action key 应打印警告', () => {
+      const warnSpy = jest
+        .spyOn(console, 'warn')
+        .mockImplementation(() => {});
+      gfstate(
+        { count: 0, inc: () => {} },
+        { watch: { inc: () => {} } as any },
+      );
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('inc'),
+      );
+      warnSpy.mockRestore();
     });
   });
 });

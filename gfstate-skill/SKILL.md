@@ -274,6 +274,31 @@ isGfstateStore(store); // true
 isGfstateStore({}); // false
 ```
 
+### External Subscribe — `store.subscribe(cb)`
+
+Subscribe to store changes from outside React components. Fires for state, computed, and nested child store changes.
+
+```tsx
+const store = gfstate({ count: 0, nested: { x: 1 } }, {
+  computed: { double: (s) => s.count * 2 },
+});
+
+// Listen to all changes
+const unsub = store.subscribe((key, newVal, oldVal) => {
+  console.log(`${key}: ${oldVal} → ${newVal}`);
+});
+
+store.count = 1; // logs "count: 0 → 1" and "double: 0 → 2"
+store.nested.x = 2; // logs "nested.x: 1 → 2"
+
+// Listen to specific key
+store.subscribe('count', (newVal, oldVal) => { ... });
+
+unsub(); // unsubscribe
+```
+
+> `subscribe` is a reserved property name. Nested child store changes use dot-path keys (e.g. `nested.x`).
+
 ## useStore() Hook
 
 Creates a component-level store with four namespaces. For full details and examples, read `references/usestore-api.md`.
@@ -348,7 +373,7 @@ const Child: React.FC<{ name: string; onUpdate: () => void }> = (props) => {
 4. **`ref` is reserved** — bypasses the reactive system, mutations don't re-render
 5. **Plain objects auto-wrap as child stores** — use `noGfstateKeys` to opt out
 6. **Reading store outside React components** — returns raw data, no subscriptions
-7. **Watch only monitors direct state keys** — cannot watch computed or nested child store keys
+7. **Watch monitors state, computed, and nested child store keys** — use `subscribe()` for external (non-React) listening
 8. **Action references are stable** — safe to pass as props, no `useCallback` needed
 
 ## Exported Types
