@@ -1,0 +1,61 @@
+{
+  "name": "gfstate",
+  "version": "0.0.1-alpha.11",
+  "description": "React简单但高性能的状态管理库",
+  "scripts": {
+    "start": "npm run dev",
+    "dev": "dumi dev",
+    "build:site": "dumi build",
+    "preview": "dumi preview",
+    "prepare": "dumi setup",
+    "prepublishOnly": "father doctor && npm run build",
+    "build": "father build",
+    "test": "jest --watch --verbose"
+  },
+  "module": "es/index.js",
+  "types": "es/index.d.ts",
+  "files": [
+    "es"
+  ],
+  "author": "chengaofeng <525280067@qq.com>",
+  "license": "MIT",
+  "commitlint": {
+    "extends": [
+      "@commitlint/config-conventional"
+    ]
+  },
+  "lint-staged": {
+    "*.{md,json}": [
+      "prettier --write --no-error-on-unmatched-pattern"
+    ]
+  },
+  "devDependencies": {
+    "@babel/runtime": "^7.28.4",
+    "@commitlint/cli": "^17.1.2",
+    "@commitlint/config-conventional": "^17.1.0",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.0",
+    "@types/jest": "^30.0.0",
+    "@types/react": "^18.0.0",
+    "@types/react-dom": "^18.0.0",
+    "@types/use-sync-external-store": "^1.5.0",
+    "dumi": "^2.4.13",
+    "jest": "^30.2.0",
+    "jest-environment-jsdom": "^30.2.0",
+    "lint-staged": "^13.0.3",
+    "prettier": "^2.7.1",
+    "ts-jest": "^29.4.5"
+  },
+  "dependencies": {
+    "@types/node": "^25.5.0",
+    "father": "^4.6.17",
+    "use-sync-external-store": "^1.6.0"
+  },
+  "peerDependencies": {
+    "react": "^18.0.0",
+    "react-dom": "^18.0.0"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  }
+}
