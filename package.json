@@ -10,7 +10,8 @@
     "prepare": "dumi setup",
     "prepublishOnly": "father doctor && npm run build",
     "build": "father build",
-    "test": "jest --watch --verbose"
+    "test": "jest --watch --verbose",
+    "publish": "npm publish --registry https://registry.npmjs.org/"
   },
   "module": "es/index.js",
   "types": "es/index.d.ts",
