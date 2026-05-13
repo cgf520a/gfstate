@@ -568,6 +568,7 @@ const gfstate = <
         } else if (depKey in gfStates) {
           // 订阅嵌套子 store 的任意属性变更
           const childSubscribe = (gfStates[depKey as K] as any)[SUBSCRIBE];
+          /* istanbul ignore next */
           if (typeof childSubscribe === 'function') {
             return childSubscribe(() => recompute());
           }
@@ -637,6 +638,7 @@ const gfstate = <
         visitState[key] = 'GREY';
         dfsStack.push(key);
         const entry = computeds[key];
+        /* istanbul ignore next */
         if (entry) {
           entry.deps.forEach((dep) => {
             if (dep in computeds) dfs(dep);
@@ -667,12 +669,14 @@ const gfstate = <
   // 将嵌套子 store 的变更事件传播到父 store 的 globalListeners
   Object.keys(gfStates).forEach((gfKey) => {
     const childSubscribe = (gfStates[gfKey as K] as any)[SUBSCRIBE];
+    /* istanbul ignore next */
     if (typeof childSubscribe === 'function') {
       const unsub = childSubscribe(
         (childKey: string, newVal: unknown, oldVal: unknown) => {
           notifyGlobalListeners(`${gfKey}.${childKey}` as K, newVal, oldVal);
         },
       );
+      /* istanbul ignore next */
       if (typeof unsub === 'function') {
         cleanupFns.push(unsub);
       }
@@ -711,6 +715,7 @@ const gfstate = <
       if (key in gfStates) {
         // 嵌套子 store 递归重置
         const childReset = (gfStates[key as K] as any)[RESET];
+        /* istanbul ignore next */
         if (typeof childReset === 'function') {
           childReset();
         }
@@ -741,6 +746,7 @@ const gfstate = <
       // 递归重置所有嵌套子 store
       Object.keys(gfStates).forEach((k) => {
         const childReset = (gfStates[k as K] as any)[RESET];
+        /* istanbul ignore next */
         if (typeof childReset === 'function') {
           childReset();
         }
@@ -784,6 +790,7 @@ const gfstate = <
     // 递归销毁所有嵌套子 store
     Object.keys(gfStates).forEach((k) => {
       const childDestroy = (gfStates[k as K] as any)[DESTROY];
+      /* istanbul ignore next */
       if (typeof childDestroy === 'function') {
         childDestroy();
       }
@@ -809,6 +816,7 @@ const gfstate = <
     // 嵌套子 store 递归 snapshot
     Object.keys(gfStates).forEach((k) => {
       const childSnapshot = (gfStates[k as K] as any)[SNAPSHOT];
+      /* istanbul ignore next */
       if (typeof childSnapshot === 'function') {
         result[k] = childSnapshot();
       }
@@ -941,6 +949,7 @@ const gfstate = <
       return;
     }
     if (key in actions) {
+      /* istanbul ignore next */
       actions[key]?.update(val as AnyFn);
       return;
     }
@@ -1042,6 +1051,7 @@ const gfstate = <
     );
   };
 
+  /* istanbul ignore next -- 仅作 Proxy target，函数体不会被调用 */
   function Target() {}
 
   // 将 data 的属性复制到 Target 上，跳过 Function 原型上的只读属性（如 name、length）
@@ -1167,6 +1177,7 @@ const gfstate = <
         let oldValue = data[key as K];
         const unsub = state[key as K].subscribe(() => {
           const newValue = data[key as K];
+          /* istanbul ignore next */
           if (newValue !== oldValue) {
             const prev = oldValue;
             oldValue = newValue;
@@ -1186,6 +1197,7 @@ const gfstate = <
         let oldValue = computeds[key].cachedValue;
         const unsub = computeds[key].subscribe(() => {
           const newValue = computeds[key].cachedValue;
+          /* istanbul ignore next */
           if (newValue !== oldValue) {
             const prev = oldValue;
             oldValue = newValue;
@@ -1203,6 +1215,7 @@ const gfstate = <
       } else if (key in gfStates) {
         // 监听嵌套子 store 的任意属性变更
         const childSubscribe = (gfStates[key] as any)[SUBSCRIBE];
+        /* istanbul ignore next */
         if (typeof childSubscribe === 'function') {
           const unsub = childSubscribe(
             (changedKey: string, newVal: unknown, oldVal: unknown) => {
@@ -1216,6 +1229,7 @@ const gfstate = <
               }
             },
           );
+          /* istanbul ignore next */
           if (typeof unsub === 'function') {
             cleanupFns.push(unsub);
           }

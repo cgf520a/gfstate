@@ -434,6 +434,83 @@ describe('插件系统', () => {
     });
   });
 
+  describe('无 name 的插件注册', () => {
+    it('name 为空字符串时抛出错误', () => {
+      expect(() => {
+        gfstate.use({ name: '' } as any);
+      }).toThrow('gfstate 插件必须提供 name 属性');
+    });
+
+    it('name 为 undefined 时抛出错误', () => {
+      expect(() => {
+        gfstate.use({ name: undefined } as any);
+      }).toThrow('gfstate 插件必须提供 name 属性');
+    });
+  });
+
+  describe('onBeforeSet 执行出错', () => {
+    it('onBeforeSet 抛出异常时打印 console.error 且不阻塞', () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+      const store = gfstate(
+        { count: 0 },
+        {
+          plugins: [
+            {
+              name: 'bad-before-set',
+              onBeforeSet: () => {
+                throw new Error('onBeforeSet boom');
+              },
+            },
+          ],
+        },
+      );
+
+      store.count = 10;
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('bad-before-set'),
+        expect.any(Error),
+      );
+      errorSpy.mockRestore();
+    });
+  });
+
+  describe('onSubscribe 执行出错', () => {
+    it('onSubscribe 抛出异常时打印 console.error 且不阻塞', () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+      const store = gfstate(
+        { count: 0 },
+        {
+          plugins: [
+            {
+              name: 'bad-subscribe',
+              onSubscribe: () => {
+                throw new Error('onSubscribe boom');
+              },
+            },
+          ],
+        },
+      );
+
+      // 全局订阅触发 onSubscribe
+      store.subscribe(() => {});
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('bad-subscribe'),
+        expect.any(Error),
+      );
+
+      errorSpy.mockClear();
+
+      // 按 key 订阅也触发 onSubscribe
+      store.subscribe('count', () => {});
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('bad-subscribe'),
+        expect.any(Error),
+      );
+
+      errorSpy.mockRestore();
+    });
+  });
+
   describe('与组件集成', () => {
     it('插件钩子在组件更新中正确触发', () => {
       const changes: Array<{ key: string; newVal: unknown; oldVal: unknown }> =
@@ -471,5 +548,177 @@ describe('插件系统', () => {
       expect(getByTestId('count').textContent).toBe('1');
       expect(changes).toEqual([{ key: 'count', newVal: 1, oldVal: 0 }]);
     });
+  });
+});
+
+describe('插件系统 - 生产模式分支覆盖', () => {
+  const originalEnv = process.env.NODE_ENV;
+
+  afterEach(() => {
+    process.env.NODE_ENV = originalEnv;
+    jest.restoreAllMocks();
+  });
+
+  it('生产模式下 registerGlobalPlugin 无 name 不抛错', () => {
+    let prodRegister: any;
+    let prodClear: any;
+    jest.isolateModules(() => {
+      process.env.NODE_ENV = 'production';
+      const mod = require('./plugins');
+      prodRegister = mod.registerGlobalPlugin;
+      prodClear = mod.clearGlobalPlugins;
+    });
+
+    // 生产模式下，空 name 不抛出
+    expect(() => {
+      prodRegister({ name: '' } as any);
+    }).not.toThrow();
+
+    prodClear();
+    process.env.NODE_ENV = originalEnv;
+  });
+
+  it('生产模式下重复注册同名插件静默跳过，不输出 warn', () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+
+    let prodRegister: any;
+    let prodClear: any;
+    jest.isolateModules(() => {
+      process.env.NODE_ENV = 'production';
+      const mod = require('./plugins');
+      prodRegister = mod.registerGlobalPlugin;
+      prodClear = mod.clearGlobalPlugins;
+    });
+
+    prodRegister({ name: 'dup-prod', onInit: jest.fn() });
+    prodRegister({ name: 'dup-prod', onInit: jest.fn() });
+
+    // 生产模式下不应输出警告
+    expect(warnSpy).not.toHaveBeenCalled();
+
+    prodClear();
+    process.env.NODE_ENV = originalEnv;
+  });
+
+  it('生产模式下 onBeforeSet 抛出异常不输出 console.error', () => {
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+
+    let prodCreateBeforeSetRunner: any;
+    jest.isolateModules(() => {
+      process.env.NODE_ENV = 'production';
+      const mod = require('./plugins');
+      prodCreateBeforeSetRunner = mod.createBeforeSetRunner;
+    });
+
+    const plugins = [
+      {
+        name: 'bad-plugin',
+        onBeforeSet: () => {
+          throw new Error('boom');
+        },
+      },
+    ];
+    const context = {} as any;
+    const runner = prodCreateBeforeSetRunner(plugins, context);
+
+    // 调用 runner 不应崩溃
+    const result = runner('key', 'newVal', 'oldVal');
+    // 生产模式下不输出 error
+    expect(errorSpy).not.toHaveBeenCalled();
+    // 异常被吞掉，返回 undefined（currentVal === newVal）
+    expect(result).toBeUndefined();
+
+    process.env.NODE_ENV = originalEnv;
+  });
+
+  it('生产模式下 onBeforeSet 返回 void 时不干预', () => {
+    let prodCreateBeforeSetRunner: any;
+    jest.isolateModules(() => {
+      process.env.NODE_ENV = 'production';
+      const mod = require('./plugins');
+      prodCreateBeforeSetRunner = mod.createBeforeSetRunner;
+    });
+
+    const plugins = [
+      {
+        name: 'noop-plugin',
+        // 返回 undefined（void），不干预设置
+        onBeforeSet: () => undefined,
+      },
+    ];
+    const context = {} as any;
+    const runner = prodCreateBeforeSetRunner(plugins, context);
+
+    const result = runner('key', 'newVal', 'oldVal');
+    // currentVal === newVal，返回 undefined
+    expect(result).toBeUndefined();
+
+    process.env.NODE_ENV = originalEnv;
+  });
+
+  it('生产模式下 onAfterSet 抛出异常不输出 console.error', () => {
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+
+    let prodCreateAfterSetRunner: any;
+    jest.isolateModules(() => {
+      process.env.NODE_ENV = 'production';
+      const mod = require('./plugins');
+      prodCreateAfterSetRunner = mod.createAfterSetRunner;
+    });
+
+    const secondAfter = jest.fn();
+    const plugins = [
+      {
+        name: 'bad-after',
+        onAfterSet: () => {
+          throw new Error('after boom');
+        },
+      },
+      {
+        name: 'good-after',
+        onAfterSet: secondAfter,
+      },
+    ];
+    const context = {} as any;
+    const runner = prodCreateAfterSetRunner(plugins, context);
+
+    runner('key', 'newVal', 'oldVal');
+
+    // 生产模式下不输出 error
+    expect(errorSpy).not.toHaveBeenCalled();
+    // 后续插件仍正常执行
+    expect(secondAfter).toHaveBeenCalled();
+
+    process.env.NODE_ENV = originalEnv;
+  });
+
+  it('生产模式下 onSubscribe 抛出异常不输出 console.error', () => {
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+
+    let prodCreateSubscribeRunner: any;
+    jest.isolateModules(() => {
+      process.env.NODE_ENV = 'production';
+      const mod = require('./plugins');
+      prodCreateSubscribeRunner = mod.createSubscribeRunner;
+    });
+
+    const plugins = [
+      {
+        name: 'bad-subscribe',
+        onSubscribe: () => {
+          throw new Error('subscribe boom');
+        },
+      },
+    ];
+    const context = {} as any;
+    const runner = prodCreateSubscribeRunner(plugins, context);
+
+    runner(null);
+    runner('key');
+
+    // 生产模式下不输出 error
+    expect(errorSpy).not.toHaveBeenCalled();
+
+    process.env.NODE_ENV = originalEnv;
   });
 });

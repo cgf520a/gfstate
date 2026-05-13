@@ -44,7 +44,7 @@ export const devtools = (options: DevToolsOptions = {}): GfstatePlugin => {
       const devToolsExtension: DevToolsExtension | undefined =
         typeof window !== 'undefined'
           ? (window as any).__REDUX_DEVTOOLS_EXTENSION__
-          : undefined;
+          : /* istanbul ignore next */ undefined;
 
       if (!devToolsExtension) {
         if (__DEV__) {

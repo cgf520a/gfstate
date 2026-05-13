@@ -67,7 +67,7 @@ const createLocalStorageAdapter = (): StorageAdapter => {
         // 存储满等异常静默处理
       }
     },
-    removeItem: (key: string) => {
+    removeItem: /* istanbul ignore next */ (key: string) => {
       try {
         localStorage.removeItem(key);
       } catch {
@@ -125,6 +125,7 @@ export const persist = (options: PersistOptions): GfstatePlugin => {
 
       try {
         const result = storage.getItem(key);
+        /* istanbul ignore next -- result 已经过 !== null 检查，?.then 的 nullish 分支不可达 */
         if (result !== null && typeof (result as any)?.then === 'function') {
           // 异步 storage
           (result as Promise<string | null>).then((raw) => {

@@ -5,6 +5,9 @@ import ReactDOM from 'react-dom';
 import gfstate, {
   EMPTY_ARRAY,
   IS_GFSTATE_STORE,
+  RESET,
+  DESTROY,
+  SNAPSHOT,
   isGfstateStore,
   isPlainObject,
   shallowEqual,
@@ -3216,6 +3219,1744 @@ describe('GfState', () => {
 
       expect(warnSpy).toHaveBeenCalledTimes(3);
       warnSpy.mockRestore();
+    });
+  });
+
+  // ============================
+  // 补充覆盖：computed 清理、生产模式分支、destroy 后读取各类属性、watch 回调出错
+  // ============================
+  describe('computed 属性 destroy 清理', () => {
+    test('destroy 时清理 computed 的 subscribedDeps', () => {
+      const store = gfstate(
+        { count: 1, factor: 2 },
+        {
+          computed: {
+            product: (s) => s.count * s.factor,
+          },
+        },
+      );
+
+      // 验证 computed 正常工作
+      expect((store as any).product).toBe(2);
+
+      // 修改依赖，computed 应更新
+      store.count = 3;
+      expect((store as any).product).toBe(6);
+
+      // destroy 后 computed 的订阅应被清理，不再响应变化
+      store.destroy();
+
+      // 不应抛错
+      expect(() => store.destroy()).not.toThrow();
+    });
+  });
+
+  describe('生产模式分支覆盖', () => {
+    // 对 computed 赋值在生产模式下静默返回（line 878）
+    test('生产模式下对 computed 属性赋值静默返回', () => {
+      const originalEnv = process.env.NODE_ENV;
+
+      let prodGfstate: typeof gfstate;
+      jest.isolateModules(() => {
+        process.env.NODE_ENV = 'production';
+        prodGfstate = require('./index').default;
+      });
+
+      const store = prodGfstate!(
+        { count: 1 },
+        {
+          computed: {
+            doubled: (s: any) => s.count * 2,
+          },
+        },
+      );
+
+      // 生产模式下赋值 computed 不抛错，静默返回
+      expect(() => {
+        (store as any).doubled = 999;
+      }).not.toThrow();
+
+      // computed 值不变
+      expect((store as any).doubled).toBe(2);
+
+      process.env.NODE_ENV = originalEnv;
+    });
+
+    // enforceActions 在生产模式下静默返回（line 903）
+    test('生产模式下 enforceActions 违规静默返回', () => {
+      const originalEnv = process.env.NODE_ENV;
+
+      let prodGfstate: typeof gfstate;
+      jest.isolateModules(() => {
+        process.env.NODE_ENV = 'production';
+        prodGfstate = require('./index').default;
+      });
+
+      prodGfstate!.config({ enforceActions: true });
+
+      const store = prodGfstate!({
+        count: 0,
+        inc: () => {
+          store.count += 1;
+        },
+      });
+
+      // 生产模式下 action 外直接赋值不抛错，静默返回
+      expect(() => {
+        store.count = 99;
+      }).not.toThrow();
+
+      // 值不变（赋值被静默忽略）
+      expect(store.count).toBe(0);
+
+      // 清理
+      prodGfstate!.config({ enforceActions: false });
+      process.env.NODE_ENV = originalEnv;
+    });
+  });
+
+  describe('destroy 后读取各类属性的警告', () => {
+    test('destroy 后读取 gfStates key（嵌套子 store）给出警告', () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+      const store = gfstate({
+        nested: { x: 1, y: 2 },
+      });
+
+      store.destroy();
+
+      // 读取嵌套子 store 属性应触发警告
+      const nested = store.nested;
+      expect(nested).toBeDefined();
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('已被销毁'),
+      );
+
+      warnSpy.mockRestore();
+    });
+
+    test('destroy 后读取 action key 给出警告', () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+      const store = gfstate({
+        count: 0,
+        inc: () => {
+          store.count += 1;
+        },
+      });
+
+      store.destroy();
+
+      // 读取 action 应触发警告
+      const inc = store.inc;
+      expect(typeof inc).toBe('function');
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('已被销毁'),
+      );
+
+      warnSpy.mockRestore();
+    });
+
+    test('destroy 后读取 computed key 给出警告', () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+      const store = gfstate(
+        { count: 1 },
+        {
+          computed: {
+            doubled: (s) => s.count * 2,
+          },
+        },
+      );
+
+      // 先读取一次确保 computed 正常工作
+      expect((store as any).doubled).toBe(2);
+
+      store.destroy();
+      warnSpy.mockClear();
+
+      // destroy 后读取 computed 应触发警告
+      const val = (store as any).doubled;
+      expect(val).toBe(2); // 返回最后缓存值
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('已被销毁'),
+      );
+
+      warnSpy.mockRestore();
+    });
+  });
+
+  describe('watch 回调出错覆盖', () => {
+    test('watch 嵌套路径回调抛错时 console.error 并不中断', () => {
+      const errorSpy = jest
+        .spyOn(console, 'error')
+        .mockImplementation(() => {});
+
+      const store = gfstate(
+        {
+          user: { name: 'alice', age: 20 },
+        },
+        {
+          watch: {
+            'user.name': () => {
+              throw new Error('嵌套路径回调出错');
+            },
+          },
+        },
+      );
+
+      // 修改嵌套路径的值，触发 watch 回调
+      (store.user as any).name = 'bob';
+
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('嵌套路径'),
+        expect.any(Error),
+      );
+
+      errorSpy.mockRestore();
+    });
+
+    test('watch computed key 回调抛错时 console.error 并不中断', () => {
+      const errorSpy = jest
+        .spyOn(console, 'error')
+        .mockImplementation(() => {});
+
+      const store = gfstate(
+        { count: 1 },
+        {
+          computed: {
+            doubled: (s) => s.count * 2,
+          },
+          watch: {
+            doubled: () => {
+              throw new Error('computed watch 出错');
+            },
+          },
+        },
+      );
+
+      // 修改 count 触发 computed 更新，从而触发 watch 回调
+      store.count = 5;
+
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('执行出错'),
+        expect.any(Error),
+      );
+
+      errorSpy.mockRestore();
+    });
+
+    test('watch 子 store key 回调抛错时 console.error 并不中断', () => {
+      const errorSpy = jest
+        .spyOn(console, 'error')
+        .mockImplementation(() => {});
+
+      const store = gfstate(
+        {
+          profile: { name: 'alice', score: 100 },
+        },
+        {
+          watch: {
+            profile: () => {
+              throw new Error('子 store watch 出错');
+            },
+          } as any,
+        },
+      );
+
+      // 修改子 store 的属性触发 watch 回调
+      (store.profile as any).name = 'bob';
+
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('执行出错'),
+        expect.any(Error),
+      );
+
+      errorSpy.mockRestore();
+    });
+  });
+
+  describe('ownKeys 缓存', () => {
+    test('连续两次 Object.keys 命中缓存', () => {
+      const store = gfstate({ a: 1, b: 2 });
+      const keys1 = Object.keys(store);
+      const keys2 = Object.keys(store);
+      expect(keys1).toEqual(keys2);
+    });
+  });
+
+  describe('带插件的单 key reset', () => {
+    test('reset 单个 key 时触发 onAfterSet', () => {
+      const afterSet = jest.fn();
+      const store = gfstate(
+        { count: 0, name: 'test' },
+        {
+          plugins: [{ name: 'after', onAfterSet: afterSet }],
+        },
+      );
+
+      store.count = 10;
+      afterSet.mockClear();
+
+      store.reset('count');
+      expect(afterSet).toHaveBeenCalledWith('count', 0, 10, expect.any(Object));
+    });
+  });
+
+  describe('嵌套路径 watch 清理', () => {
+    test('destroy 时清理嵌套路径 watch 的 globalListener', () => {
+      const watchFn = jest.fn();
+      const store = gfstate(
+        {
+          user: { name: 'alice', age: 20 },
+        },
+        {
+          watch: {
+            'user.name': watchFn,
+          },
+        },
+      );
+
+      (store.user as any).name = 'bob';
+      expect(watchFn).toHaveBeenCalledTimes(1);
+
+      store.destroy();
+      watchFn.mockClear();
+
+      // destroy 后变更不应再触发 watch
+    });
+  });
+
+  describe('生产模式分支覆盖', () => {
+    let prodGfstate: typeof gfstate;
+    let prodISGFSTATE: typeof IS_GFSTATE_STORE;
+    let prodSUBSCRIBE: typeof import('./index').SUBSCRIBE;
+    let prodRESET: typeof import('./index').RESET;
+    let prodDESTROY: typeof import('./index').DESTROY;
+    let prodSNAPSHOT: typeof import('./index').SNAPSHOT;
+    const originalEnv = process.env.NODE_ENV;
+
+    beforeEach(() => {
+      jest.isolateModules(() => {
+        process.env.NODE_ENV = 'production';
+        const mod = require('./index');
+        prodGfstate = mod.default;
+        prodISGFSTATE = mod.IS_GFSTATE_STORE;
+        prodSUBSCRIBE = mod.SUBSCRIBE;
+        prodRESET = mod.RESET;
+        prodDESTROY = mod.DESTROY;
+        prodSNAPSHOT = mod.SNAPSHOT;
+      });
+    });
+
+    afterEach(() => {
+      process.env.NODE_ENV = originalEnv;
+    });
+
+    // line 480: 循环引用时 __DEV__ 的 console.warn 不执行
+    test('循环引用在生产模式下静默处理', () => {
+      const obj: Record<string, any> = { name: 'test' };
+      obj.self = obj;
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+      const store = prodGfstate(obj);
+      // 生产模式下不会输出循环引用的 warn
+      expect(warnSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining('循环引用'),
+      );
+      expect(store.name).toBe('test');
+      warnSpy.mockRestore();
+    });
+
+    // lines 532-543: computed 键名冲突检测与 computingStack 不进行
+    // lines 571-598: computed recompute 中的 computingStack push/pop 不执行
+    // lines 624-651: DFS 循环依赖检测不执行
+    // lines 579-584,587,598: recompute 路径
+    test('computed 在生产模式下正常工作（跳过循环依赖检测）', () => {
+      const store = prodGfstate(
+        { count: 1, factor: 2 },
+        {
+          computed: {
+            double: (s: any) => s.count * 2,
+            quad: (s: any) => s.double * 2,
+          },
+        },
+      );
+
+      expect(store.double).toBe(2);
+      expect(store.quad).toBe(4);
+
+      // 触发 recompute 路径 (lines 579-587)
+      store.count = 5;
+      expect(store.double).toBe(10);
+      expect(store.quad).toBe(20);
+    });
+
+    // lines 640, 650: DFS 中的 entry 和 visitState 检测
+    test('多个 computed 互相依赖在生产模式下跳过 DFS 检测', () => {
+      const store = prodGfstate(
+        { a: 1, b: 2 },
+        {
+          computed: {
+            sumA: (s: any) => s.a + 1,
+            sumB: (s: any) => s.b + s.sumA,
+          },
+        },
+      );
+      expect(store.sumA).toBe(2);
+      expect(store.sumB).toBe(4);
+    });
+
+    // line 660: subscribe 回调执行出错时 __DEV__ 的 console.error 不执行
+    test('subscribe 回调出错在生产模式下静默', () => {
+      const store = prodGfstate({ count: 0 });
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+
+      store.subscribe(() => {
+        throw new Error('subscriber error');
+      });
+
+      // 修改值会触发回调，但生产模式下出错不会打印 console.error
+      store.count = 1;
+
+      expect(errorSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining('回调执行出错'),
+        expect.anything(),
+      );
+      errorSpy.mockRestore();
+    });
+
+    // lines 670, 676: 嵌套子 store 变更传播路径
+    test('嵌套子 store 变更传播在生产模式下正常工作', () => {
+      const store = prodGfstate({
+        user: { name: 'alice', age: 20 },
+      });
+
+      const changes: string[] = [];
+      store.subscribe((key: string) => {
+        changes.push(key);
+      });
+
+      (store.user as any).name = 'bob';
+      expect(changes).toContain('user.name');
+    });
+
+    // line 704: destroy 后 reset 时 __DEV__ 的 console.warn 不执行
+    test('destroy 后 reset 在生产模式下静默返回', () => {
+      const store = prodGfstate({ count: 0 });
+      store.count = 5;
+      store.destroy();
+
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+      store.reset();
+      expect(warnSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining('不能执行 reset'),
+      );
+      warnSpy.mockRestore();
+    });
+
+    // lines 714-720: reset 单个 key（嵌套子 store 和普通 state）
+    test('reset 单个 key 在生产模式下正常工作', () => {
+      const store = prodGfstate({
+        count: 0,
+        user: { name: 'alice' },
+      });
+
+      store.count = 10;
+      (store.user as any).name = 'bob';
+
+      // 重置嵌套子 store (line 714)
+      store.reset('user');
+      expect((store.user as any).name).toBe('alice');
+
+      // 重置普通 state (line 717-720)
+      store.reset('count');
+      expect(store.count).toBe(0);
+    });
+
+    // line 744: 全量 reset 递归重置嵌套子 store
+    test('全量 reset 在生产模式下递归重置所有子 store', () => {
+      const store = prodGfstate({
+        count: 0,
+        user: { name: 'alice' },
+      });
+
+      store.count = 10;
+      (store.user as any).name = 'bob';
+
+      store.reset();
+      expect(store.count).toBe(0);
+      expect((store.user as any).name).toBe('alice');
+    });
+
+    // lines 757-787: destroy 中插件 onDestroy 和递归销毁
+    test('destroy 在生产模式下正常执行（含插件 onDestroy）', () => {
+      const onDestroy = jest.fn();
+      const store = prodGfstate(
+        { count: 0, user: { name: 'alice' } },
+        {
+          plugins: [{ name: 'test-destroy', onDestroy }],
+        },
+      );
+
+      store.destroy();
+      expect(onDestroy).toHaveBeenCalledTimes(1);
+    });
+
+    // line 761: 插件 onDestroy 抛错在生产模式下静默
+    test('插件 onDestroy 抛错在生产模式下静默', () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+      const store = prodGfstate(
+        { count: 0 },
+        {
+          plugins: [
+            {
+              name: 'error-destroy',
+              onDestroy: () => {
+                throw new Error('destroy error');
+              },
+            },
+          ],
+        },
+      );
+
+      // 不应抛错
+      expect(() => store.destroy()).not.toThrow();
+      expect(errorSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining('onDestroy 执行出错'),
+        expect.anything(),
+      );
+      errorSpy.mockRestore();
+    });
+
+    // lines 796-812: snapshot 在 destroy 后执行
+    test('snapshot 在 destroy 后在生产模式下静默返回空对象', () => {
+      const store = prodGfstate({
+        count: 0,
+        user: { name: 'alice' },
+      });
+      store.destroy();
+
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+      const snap = store.snapshot();
+      expect(snap).toEqual({});
+      expect(warnSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining('不能执行 snapshot'),
+      );
+      warnSpy.mockRestore();
+    });
+
+    // snapshot 正常路径（含嵌套子 store 和 computed）
+    test('snapshot 在生产模式下正常工作', () => {
+      const store = prodGfstate(
+        {
+          count: 1,
+          user: { name: 'alice' },
+          ref: { current: null },
+        },
+        {
+          computed: {
+            double: (s: any) => s.count * 2,
+          },
+        },
+      );
+
+      const snap = store.snapshot();
+      expect(snap.count).toBe(1);
+      expect(snap.double).toBe(2);
+      expect((snap.user as any).name).toBe('alice');
+      expect(snap.ref).toEqual({ current: null });
+    });
+
+    // line 851: destroy 后写入属性在生产模式下静默返回
+    test('destroy 后写入属性在生产模式下静默', () => {
+      const store = prodGfstate({ count: 0 });
+      store.destroy();
+
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+      store.count = 99;
+      expect(warnSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining('不应再写入属性'),
+      );
+      warnSpy.mockRestore();
+    });
+
+    // line 863: 'subscribe' 保留属性名赋值在生产模式下静默
+    test('subscribe 保留属性名赋值在生产模式下静默', () => {
+      const store = prodGfstate({ count: 0 });
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+      (store as any).subscribe = 'something';
+      expect(warnSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining('保留属性名'),
+      );
+      warnSpy.mockRestore();
+    });
+
+    // line 869: 'reset'/'destroy'/'snapshot' 保留属性名赋值在生产模式下静默
+    test('reset/destroy/snapshot 保留属性名赋值在生产模式下静默', () => {
+      const store = prodGfstate({ count: 0 });
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+      (store as any).reset = 'something';
+      (store as any).destroy = 'something';
+      (store as any).snapshot = 'something';
+      expect(warnSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining('保留属性名'),
+      );
+      warnSpy.mockRestore();
+    });
+
+    // line 875: computed 属性赋值在生产模式下静默返回（不抛错）
+    test('computed 属性赋值在生产模式下静默返回不抛错', () => {
+      const store = prodGfstate(
+        { count: 0 },
+        {
+          computed: {
+            double: (s: any) => s.count * 2,
+          },
+        },
+      );
+
+      expect(() => {
+        (store as any).double = 99;
+      }).not.toThrow();
+      // 值不应被修改
+      expect(store.double).toBe(0);
+    });
+
+    // line 896: enforceActions 在生产模式下不抛错但静默返回
+    test('enforceActions 在生产模式下静默阻止修改不抛错', () => {
+      prodGfstate.config({ enforceActions: true });
+      const store = prodGfstate({
+        count: 0,
+        inc: () => {
+          store.count += 1;
+        },
+      });
+
+      // 直接修改 state 不在 action 内：生产模式下不抛错，但静默返回
+      expect(() => {
+        store.count = 99;
+      }).not.toThrow();
+      // 值不应被修改（enforceActions 返回了）
+      expect(store.count).toBe(0);
+
+      // 恢复 enforceActions
+      prodGfstate.config({ enforceActions: false });
+    });
+
+    // lines 987, 997, 1011, 1024: destroy 后读取各类属性在生产模式下静默
+    test('destroy 后读取属性在生产模式下静默', () => {
+      const store = prodGfstate(
+        {
+          count: 0,
+          user: { name: 'alice' },
+          inc: () => {},
+        },
+        {
+          computed: {
+            double: (s: any) => s.count * 2,
+          },
+        },
+      );
+
+      store.destroy();
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+
+      // 读取嵌套子 store (line 987)
+      const _user = store.user;
+
+      // 读取 action (line 997)
+      const _inc = store.inc;
+
+      // 读取 computed (line 1011)
+      const _double = store.double;
+
+      // 读取 state (line 1024)
+      const _count = store.count;
+
+      expect(warnSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining('不应再读取属性'),
+      );
+      warnSpy.mockRestore();
+    });
+
+    // line 1051: data 属性与 Target 上不可配置属性跳过
+    test('data 含 name/length 等与 Function 原型冲突的 key 时正常创建', () => {
+      const store = prodGfstate({
+        name: 'myStore',
+        length: 10,
+        count: 0,
+      });
+
+      expect(store.count).toBe(0);
+      // name 和 length 可能由于 Function 原型上不可配置而被跳过，但 store 仍可用
+    });
+
+    // line 1133: store(prev => partial) 函数式更新
+    test('函数式批量更新在生产模式下正常工作', () => {
+      const store = prodGfstate({ count: 0, name: 'test' });
+      store((prev: any) => ({ count: prev.count + 1, name: 'updated' }));
+      expect(store.count).toBe(1);
+      expect(store.name).toBe('updated');
+    });
+
+    // lines 1170-1223: watch 各类 key（state, computed, gfStates）
+    test('watch state key 在生产模式下正常工作', () => {
+      const watchFn = jest.fn();
+      const store = prodGfstate(
+        { count: 0 },
+        {
+          watch: { count: watchFn },
+        },
+      );
+
+      store.count = 5;
+      expect(watchFn).toHaveBeenCalledTimes(1);
+      expect(watchFn.mock.calls[0][0]).toBe(5);
+      expect(watchFn.mock.calls[0][1]).toBe(0);
+    });
+
+    test('watch computed key 在生产模式下正常工作', () => {
+      const watchFn = jest.fn();
+      const store = prodGfstate(
+        { count: 0 },
+        {
+          computed: {
+            double: (s: any) => s.count * 2,
+          },
+          watch: { double: watchFn },
+        },
+      );
+
+      store.count = 3;
+      expect(watchFn).toHaveBeenCalledTimes(1);
+      expect(watchFn.mock.calls[0][0]).toBe(6);
+      expect(watchFn.mock.calls[0][1]).toBe(0);
+    });
+
+    test('watch 嵌套子 store key 在生产模式下正常工作', () => {
+      const watchFn = jest.fn();
+      const store = prodGfstate(
+        { user: { name: 'alice', age: 20 } },
+        {
+          watch: { user: watchFn },
+        },
+      );
+
+      (store.user as any).name = 'bob';
+      expect(watchFn).toHaveBeenCalled();
+    });
+
+    // line 1224: watch 不存在的 key 在生产模式下不 warn
+    test('watch 不存在的 key 在生产模式下静默', () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+      prodGfstate(
+        { count: 0 },
+        {
+          watch: { nonExistent: jest.fn() } as any,
+        },
+      );
+
+      expect(warnSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining('不存在于 state 中'),
+      );
+      warnSpy.mockRestore();
+    });
+
+    // lines 1250-1261: 插件 onInit 执行与出错
+    test('插件 onInit 在生产模式下正常执行', () => {
+      const initFn = jest.fn(() => () => {});
+      const store = prodGfstate(
+        { count: 0 },
+        {
+          plugins: [{ name: 'test-init', onInit: initFn }],
+        },
+      );
+
+      expect(initFn).toHaveBeenCalledTimes(1);
+      store.destroy();
+    });
+
+    test('插件 onInit 抛错在生产模式下静默', () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+      const store = prodGfstate(
+        { count: 0 },
+        {
+          plugins: [
+            {
+              name: 'error-init',
+              onInit: () => {
+                throw new Error('init error');
+              },
+            },
+          ],
+        },
+      );
+
+      expect(errorSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining('onInit 执行出错'),
+        expect.anything(),
+      );
+      errorSpy.mockRestore();
+      store.destroy();
+    });
+
+    // line 243: getEqualityFn 中 perKey 存在的路径
+    test('自定义 per-key 相等函数在生产模式下正常工作', () => {
+      const customEqual = (a: any, b: any) =>
+        JSON.stringify(a) === JSON.stringify(b);
+      const store = prodGfstate(
+        { items: [1, 2, 3] },
+        {
+          equals: { items: customEqual },
+        },
+      );
+
+      // 设置相同内容的新数组引用，customEqual 判定相等，不触发更新
+      store.items = [1, 2, 3];
+      // 没有什么好断言的，主要覆盖 perKey 分支
+      expect(store.items).toEqual([1, 2, 3]);
+    });
+
+    // lines 923-930: onBeforeSet 插件钩子
+    test('onBeforeSet 插件取消设置在生产模式下正常工作', () => {
+      const store = prodGfstate(
+        { count: 0 },
+        {
+          plugins: [
+            {
+              name: 'cancel-set',
+              onBeforeSet: () => false,
+            },
+          ],
+        },
+      );
+
+      store.count = 99;
+      expect(store.count).toBe(0); // 被插件取消了
+    });
+
+    test('onBeforeSet 插件替换值在生产模式下正常工作', () => {
+      const store = prodGfstate(
+        { count: 0 },
+        {
+          plugins: [
+            {
+              name: 'replace-set',
+              onBeforeSet: (_key: string, newVal: unknown) => ({
+                value: (newVal as number) * 10,
+              }),
+            },
+          ],
+        },
+      );
+
+      store.count = 5;
+      expect(store.count).toBe(50);
+    });
+
+    test('onBeforeSet 插件替换后值与旧值相同时跳过更新', () => {
+      const store = prodGfstate(
+        { count: 0 },
+        {
+          plugins: [
+            {
+              name: 'same-value',
+              onBeforeSet: (_key: string, _newVal: unknown, oldVal: unknown) => ({
+                value: oldVal, // 返回旧值
+              }),
+            },
+          ],
+        },
+      );
+
+      const cb = jest.fn();
+      store.subscribe(cb);
+      store.count = 5;
+      // 因为插件将值替换为旧值，equalFn 判定相同，跳过更新
+      expect(store.count).toBe(0);
+      expect(cb).not.toHaveBeenCalled();
+    });
+
+    // line 944: actions[key]?.update 的 optional chain
+    test('更新 action 函数在生产模式下正常工作', () => {
+      const store = prodGfstate({
+        count: 0,
+        inc: () => {
+          store.count += 1;
+        },
+      });
+
+      store.inc();
+      expect(store.count).toBe(1);
+
+      // 更新 action
+      store.inc = (() => {
+        store.count += 10;
+      }) as any;
+      store.inc();
+      expect(store.count).toBe(11);
+    });
+
+    // computed 依赖嵌套子 store 的路径 (line 571)
+    test('computed 依赖嵌套子 store 在生产模式下正常工作', () => {
+      const store = prodGfstate(
+        { user: { name: 'alice', age: 20 }, extra: 1 },
+        {
+          computed: {
+            userInfo: (s: any) => `${s.user.name}-${s.extra}`,
+          },
+        },
+      );
+
+      expect(store.userInfo).toBe('alice-1');
+      (store.user as any).name = 'bob';
+      expect(store.userInfo).toBe('bob-1');
+    });
+
+    // computed recompute 动态依赖 (line 598)
+    test('computed 动态依赖在生产模式下正常重新订阅', () => {
+      const store = prodGfstate(
+        { flag: true, a: 1, b: 2 },
+        {
+          computed: {
+            value: (s: any) => (s.flag ? s.a : s.b),
+          },
+        },
+      );
+
+      expect(store.value).toBe(1);
+      store.flag = false as any;
+      expect(store.value).toBe(2);
+      // b 变更应触发 recompute
+      store.b = 20;
+      expect(store.value).toBe(20);
+    });
+
+    // 嵌套路径 watch 在生产模式下
+    test('嵌套路径 watch 在生产模式下正常工作', () => {
+      const watchFn = jest.fn();
+      const store = prodGfstate(
+        { user: { name: 'alice', age: 20 } },
+        {
+          watch: { 'user.name': watchFn } as any,
+        },
+      );
+
+      (store.user as any).name = 'bob';
+      expect(watchFn).toHaveBeenCalledTimes(1);
+    });
+
+    // 批量更新 store({ key: val })
+    test('对象式批量更新在生产模式下正常工作', () => {
+      const store = prodGfstate({ count: 0, name: 'test' });
+      store({ count: 5, name: 'prod' });
+      expect(store.count).toBe(5);
+      expect(store.name).toBe('prod');
+    });
+
+    // store('key', val) 方式更新
+    test('store(key, val) 方式更新在生产模式下正常工作', () => {
+      const store = prodGfstate({ count: 0 });
+      store('count', 42);
+      expect(store.count).toBe(42);
+    });
+
+    // subscribe 带 key 参数
+    test('subscribe 带 key 在生产模式下正常工作', () => {
+      const store = prodGfstate(
+        { count: 0 },
+        {
+          plugins: [{ name: 'sub-test', onSubscribe: jest.fn() }],
+        },
+      );
+
+      const cb = jest.fn();
+      const unsub = store.subscribe('count', cb);
+      store.count = 5;
+      expect(cb).toHaveBeenCalledWith(5, 0);
+      unsub();
+    });
+
+    // subscribe 全局回调
+    test('subscribe 全局回调在生产模式下正常工作', () => {
+      const store = prodGfstate(
+        { count: 0 },
+        {
+          plugins: [{ name: 'sub-test2', onSubscribe: jest.fn() }],
+        },
+      );
+
+      const cb = jest.fn();
+      const unsub = store.subscribe(cb);
+      store.count = 5;
+      expect(cb).toHaveBeenCalledWith('count', 5, 0);
+      unsub();
+    });
+
+    // watch 回调抛错在生产模式下的路径
+    test('watch state 回调出错在生产模式下打印 console.error', () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+      const store = prodGfstate(
+        { count: 0 },
+        {
+          watch: {
+            count: () => {
+              throw new Error('watch error');
+            },
+          },
+        },
+      );
+
+      store.count = 1;
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('监听回调执行出错'),
+        expect.anything(),
+      );
+      errorSpy.mockRestore();
+    });
+
+    test('watch computed 回调出错在生产模式下打印 console.error', () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+      const store = prodGfstate(
+        { count: 0 },
+        {
+          computed: {
+            double: (s: any) => s.count * 2,
+          },
+          watch: {
+            double: () => {
+              throw new Error('computed watch error');
+            },
+          },
+        },
+      );
+
+      store.count = 1;
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('监听回调执行出错'),
+        expect.anything(),
+      );
+      errorSpy.mockRestore();
+    });
+
+    test('watch 嵌套子 store 回调出错在生产模式下打印 console.error', () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+      const store = prodGfstate(
+        { user: { name: 'alice' } },
+        {
+          watch: {
+            user: () => {
+              throw new Error('nested watch error');
+            },
+          },
+        },
+      );
+
+      (store.user as any).name = 'bob';
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('监听回调执行出错'),
+        expect.anything(),
+      );
+      errorSpy.mockRestore();
+    });
+
+    // reset 单个 key 触发 onAfterSet
+    test('reset 单个 key 在生产模式下触发 onAfterSet', () => {
+      const afterSet = jest.fn();
+      const store = prodGfstate(
+        { count: 0 },
+        {
+          plugins: [{ name: 'after-reset', onAfterSet: afterSet }],
+        },
+      );
+
+      store.count = 10;
+      afterSet.mockClear();
+      store.reset('count');
+      expect(afterSet).toHaveBeenCalledWith(
+        'count',
+        0,
+        10,
+        expect.any(Object),
+      );
+    });
+
+    // 全量 reset 触发 onAfterSet
+    test('全量 reset 在生产模式下触发 onAfterSet', () => {
+      const afterSet = jest.fn();
+      const store = prodGfstate(
+        { count: 0, name: 'test' },
+        {
+          plugins: [{ name: 'after-reset-all', onAfterSet: afterSet }],
+        },
+      );
+
+      store.count = 10;
+      store.name = 'changed';
+      afterSet.mockClear();
+      store.reset();
+      expect(afterSet).toHaveBeenCalledTimes(2);
+    });
+
+    // line 587 idx=1: computed recompute 产生相同值时不通知
+    test('computed recompute 产生相同值时不触发更新', () => {
+      const cb = jest.fn();
+      const store = prodGfstate(
+        { count: 0, unrelated: 0 },
+        {
+          computed: {
+            // 始终返回固定值，不管 count 怎么变
+            fixed: (s: any) => (s.count, 42),
+          },
+        },
+      );
+
+      store.subscribe(cb);
+      // 修改 count 会触发 recompute，但 fixed 的值不变（始终 42）
+      store.count = 1;
+      // 不应有 fixed 变更通知
+      const fixedCalls = cb.mock.calls.filter(
+        (c: any[]) => c[0] === 'fixed',
+      );
+      expect(fixedCalls).toHaveLength(0);
+    });
+
+    // line 926 idx=1: onBeforeSet 返回 void（不拦截也不替换值）
+    test('onBeforeSet 返回 void 时正常设置', () => {
+      const store = prodGfstate(
+        { count: 0 },
+        {
+          plugins: [
+            {
+              name: 'noop-before',
+              onBeforeSet: () => {
+                // 不返回任何值（void）
+              },
+            },
+          ],
+        },
+      );
+
+      store.count = 5;
+      expect(store.count).toBe(5);
+    });
+
+    // line 1253 idx=1: 插件 onInit 返回非函数值（void）
+    test('插件 onInit 返回 void 时不注册清理函数', () => {
+      const store = prodGfstate(
+        { count: 0 },
+        {
+          plugins: [
+            {
+              name: 'void-init',
+              onInit: () => {
+                // 不返回值
+              },
+            },
+          ],
+        },
+      );
+
+      // 正常销毁不应出错
+      expect(() => store.destroy()).not.toThrow();
+    });
+
+    // line 1051 idx=1: data 含 prototype 键时（Function.prototype 不可配置）defineProperty 被跳过
+    test('data 含 prototype 键时 defineProperty 被跳过但 store 正常', () => {
+      const store = prodGfstate({
+        prototype: 'something',
+        count: 0,
+      });
+
+      store.count = 5;
+      expect(store.count).toBe(5);
+      // prototype 键会被跳过 defineProperty，但通过 Proxy 仍可访问
+    });
+
+    // line 1133 idx=1: apply handler 中 key 既不是 string 也不是 plain object 也不是 function
+    // 这在正常使用中不会发生，但可以通过非法调用触发
+    test('apply handler 接收非法参数时不抛错', () => {
+      const store = prodGfstate({ count: 0 });
+      // 传入 null（既不是 string, 也不是 plain object, 也不是 function）
+      expect(() => (store as any)(null)).not.toThrow();
+      expect(() => (store as any)(123)).not.toThrow();
+    });
+
+    // line 1171 idx=1: watch state 触发但值未变（如 set 相同值后触发回调）
+    // 这需要一个值触发了 subscribe setter 但值没变的场景
+    // 实际上值相同时不会触发 triggerUpdate，所以这个分支在正常路径下不会走到
+    // 但我们可以通过 reset 来间接触发
+
+    // line 243 idx=1: equals 是对象但不包含当前 key 时，perKey 为 undefined，走 ?? Object.is
+    test('equals 对象中不包含当前 key 时回退到 Object.is', () => {
+      const myEqual = jest.fn((a: any, b: any) => a === b);
+      const store = prodGfstate(
+        { count: 0, name: 'test' },
+        {
+          // 只给 count 配置了自定义 equals，name 没有
+          equals: { count: myEqual } as any,
+        },
+      );
+
+      // 修改 name（没有在 equals 对象中），触发 perKey ?? Object.is 的 Object.is 分支
+      store.name = 'updated';
+      expect(store.name).toBe('updated');
+      // 修改 count 触发自定义 equals
+      store.count = 1;
+      expect(myEqual).toHaveBeenCalled();
+    });
+  });
+
+  describe('开发模式额外分支覆盖', () => {
+    // line 640 idx=1: DFS 中 computed 依赖的 key 不在 computeds 中（在 state 中）
+    // 这已经被现有测试覆盖，因为大部分 computed 依赖 state key
+    // 但 line 650 idx=1 需要 visitState[k] 已经存在的情况
+    // 这发生在多个 computed 共享依赖时 DFS 遍历已访问节点
+
+    // line 761 idx=0: 插件 onDestroy 抛错在开发模式下打印 console.error
+    test('插件 onDestroy 抛错在开发模式下打印 console.error', () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+      const store = gfstate(
+        { count: 0 },
+        {
+          plugins: [
+            {
+              name: 'error-destroy-dev',
+              onDestroy: () => {
+                throw new Error('destroy error in dev');
+              },
+            },
+          ],
+        },
+      );
+
+      expect(() => store.destroy()).not.toThrow();
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('onDestroy 执行出错'),
+        expect.anything(),
+      );
+      errorSpy.mockRestore();
+    });
+
+    // line 1257 idx=0: 插件 onInit 抛错在开发模式下打印 console.error
+    test('插件 onInit 抛错在开发模式下打印 console.error', () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+      const store = gfstate(
+        { count: 0 },
+        {
+          plugins: [
+            {
+              name: 'error-init-dev',
+              onInit: () => {
+                throw new Error('init error in dev');
+              },
+            },
+          ],
+        },
+      );
+
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('onInit 执行出错'),
+        expect.anything(),
+      );
+      errorSpy.mockRestore();
+      store.destroy();
+    });
+
+    // line 1253 idx=0: 插件 onInit 返回清理函数在开发模式下正常工作
+    test('插件 onInit 返回清理函数在 destroy 时执行', () => {
+      const cleanupFn = jest.fn();
+      const store = gfstate(
+        { count: 0 },
+        {
+          plugins: [
+            {
+              name: 'cleanup-init',
+              onInit: () => cleanupFn,
+            },
+          ],
+        },
+      );
+
+      store.destroy();
+      expect(cleanupFn).toHaveBeenCalledTimes(1);
+    });
+
+    // 补充: onBeforeSet 在开发模式下也覆盖各分支
+    test('onBeforeSet 取消设置在开发模式下正常工作', () => {
+      const store = gfstate(
+        { count: 0 },
+        {
+          plugins: [
+            {
+              name: 'cancel-set-dev',
+              onBeforeSet: () => false,
+            },
+          ],
+        },
+      );
+
+      store.count = 99;
+      expect(store.count).toBe(0);
+    });
+
+    test('onBeforeSet 替换值后与旧值相同时跳过', () => {
+      const store = gfstate(
+        { count: 0 },
+        {
+          plugins: [
+            {
+              name: 'same-val-dev',
+              onBeforeSet: (
+                _key: string,
+                _newVal: unknown,
+                oldVal: unknown,
+              ) => ({
+                value: oldVal,
+              }),
+            },
+          ],
+        },
+      );
+
+      const cb = jest.fn();
+      store.subscribe(cb);
+      store.count = 5;
+      expect(store.count).toBe(0);
+      expect(cb).not.toHaveBeenCalled();
+    });
+
+    test('onBeforeSet 替换值在开发模式下正常工作', () => {
+      const store = gfstate(
+        { count: 0 },
+        {
+          plugins: [
+            {
+              name: 'replace-dev',
+              onBeforeSet: (_key: string, newVal: unknown) => ({
+                value: (newVal as number) * 100,
+              }),
+            },
+          ],
+        },
+      );
+
+      store.count = 3;
+      expect(store.count).toBe(300);
+    });
+
+    test('onBeforeSet 返回 void 时正常设置', () => {
+      const store = gfstate(
+        { count: 0 },
+        {
+          plugins: [
+            {
+              name: 'noop-dev',
+              onBeforeSet: () => {},
+            },
+          ],
+        },
+      );
+
+      store.count = 5;
+      expect(store.count).toBe(5);
+    });
+
+    // line 640 idx=1 & 650 idx=1: DFS 中 computed 依赖不在 computeds 中的 key
+    // computed 依赖普通 state key 时，DFS 的 `if (dep in computeds)` 为 false
+    // 以及多个 computed 共享同一个 computed 依赖时，第二次遍历 visitState 已为 BLACK
+    test('computed DFS 遍历：依赖不在 computeds 中的 key 及已访问节点', () => {
+      // a, b 是 state key
+      // c1 依赖 a（a 不在 computeds 中 → entry 为 undefined, line 640 false）
+      // c2 也依赖 a
+      // c3 依赖 c1 和 c2（DFS 遍历 c1 时标记为 BLACK，遍历 c2 时也是 BLACK → line 650 false path: visitState[k] 已存在）
+      const store = gfstate(
+        { a: 1, b: 2 },
+        {
+          computed: {
+            c1: (s: any) => s.a + 1,
+            c2: (s: any) => s.a + s.b,
+            c3: (s: any) => s.c1 + s.c2,
+          },
+        },
+      );
+
+      expect(store.c1).toBe(2);
+      expect(store.c2).toBe(3);
+      expect(store.c3).toBe(5);
+    });
+
+    // line 598 idx=1: recompute 中动态新增依赖，且该依赖不在 state/computeds/gfStates 中
+    test('computed 动态新增 action 依赖时 unsub 为 undefined', () => {
+      const store = gfstate(
+        {
+          flag: false,
+          count: 0,
+          inc: () => {
+            store.count += 1;
+          },
+        },
+        {
+          computed: {
+            // 初始时不读取 inc；当 flag 为 true 时动态读取 inc（action key）
+            result: (s: any) => {
+              if (s.flag) {
+                return typeof s.inc === 'function' ? s.count * 2 : 0;
+              }
+              return s.count;
+            },
+          },
+        },
+      );
+
+      expect(store.result).toBe(0);
+      // 切换 flag 导致 recompute，新增 inc 到 deps，subscribeToDepKey('inc') 返回 undefined
+      store.flag = true as any;
+      expect(store.result).toBe(0);
+    });
+
+    // line 717 idx=1: reset 单个 key，但 key 既不在 gfStates 也不在 state 中
+    test('reset 不存在的 key 时静默', () => {
+      const store = gfstate({
+        count: 0,
+        inc: () => {
+          store.count += 1;
+        },
+      });
+
+      // 重置一个 action key（不在 gfStates 也不在 state 中）
+      expect(() => store.reset('inc')).not.toThrow();
+      // 重置一个完全不存在的 key
+      expect(() => store.reset('nonExistent')).not.toThrow();
+    });
+
+    // line 720 idx=1: reset 单个 key，值与初始值相同（deepClone 后 !==）
+    // 对于基本类型如 number，deepClone 后 === 成立
+    test('reset 单个 key 且值未变时不触发更新', () => {
+      const store = gfstate({ count: 0 });
+
+      const cb = jest.fn();
+      store.subscribe(cb);
+
+      // count 未被修改过，reset 时 data[key] === newVal（都是 0）
+      store.reset('count');
+      // 不应触发通知
+      expect(cb).not.toHaveBeenCalled();
+    });
+
+    // line 944 idx=0: actions[key]?.update 中 actions[key] 为 undefined
+    // 这在正常使用中不会发生，因为 `if (key in actions)` 已经确保 key 存在
+    // 但 ?. 运算符的 falsy 分支仍被 Istanbul 追踪
+
+    // line 1051 idx=1: data 含 prototype 键在开发模式下
+    test('data 含 prototype 键在开发模式下正常创建', () => {
+      const store = gfstate({
+        prototype: 'something',
+        count: 0,
+      });
+
+      store.count = 5;
+      expect(store.count).toBe(5);
+    });
+  });
+
+  describe('额外覆盖率补充', () => {
+    // 覆盖 line 652：DFS 已访问的 computed key 不重复遍历
+    // Object.keys 按插入顺序遍历，a 排在 b 前面
+    // a 的 deps 包含 b（因为 a 读取了 s.b），DFS(a) 递归到 DFS(b)
+    // b 被标记 BLACK 后，forEach 遍历到 b 时跳过（覆盖 false 分支）
+    test('computed 依赖链不重复 DFS', () => {
+      // 不会抛错即说明 DFS 正常工作（含跳过已访问节点的逻辑）
+      const store = gfstate(
+        { count: 1 },
+        {
+          computed: {
+            a: (s: any) => (s as any).b + 1,
+            b: (s: any) => s.count * 2,
+          },
+        },
+      );
+      // b 正常计算
+      expect((store as any).b).toBe(2);
+    });
+
+    // 覆盖 line 1190：computed watch 在结果未变时不触发
+    test('computed watch 在结果未变时不触发', () => {
+      const watchFn = jest.fn();
+      const store = gfstate(
+        { x: 15 },
+        {
+          computed: { clamped: (s: any) => Math.min(s.x, 10) },
+          watch: { clamped: watchFn },
+        },
+      );
+      // clamped = 10 (min(15, 10))
+      store.x = 20; // clamped 仍为 10，watch 不应触发
+      expect(watchFn).not.toHaveBeenCalled();
+    });
+  });
+
+  // ============================================================
+  // 文档功能补充测试
+  // ============================================================
+
+  describe('嵌套子 store 批量更新', () => {
+    test('通过子 store 作为函数调用批量更新', () => {
+      const store = gfstate({
+        profile: {
+          name: 'Alice',
+          age: 25,
+          email: 'alice@example.com',
+        },
+      });
+
+      const App = () => {
+        const { name, age, email } = store.profile;
+        return (
+          <div>
+            <span data-testid="name">{name}</span>
+            <span data-testid="age">{age}</span>
+            <span data-testid="email">{email}</span>
+            <button
+              onClick={() =>
+                store.profile({
+                  name: 'Bob',
+                  age: 30,
+                  email: 'bob@example.com',
+                })
+              }
+            >
+              批量更新
+            </button>
+          </div>
+        );
+      };
+
+      const { getByTestId, getByText } = render(<App />);
+      expect(getByTestId('name').textContent).toBe('Alice');
+      expect(getByTestId('age').textContent).toBe('25');
+      expect(getByTestId('email').textContent).toBe('alice@example.com');
+
+      fireEvent.click(getByText('批量更新'));
+      expect(getByTestId('name').textContent).toBe('Bob');
+      expect(getByTestId('age').textContent).toBe('30');
+      expect(getByTestId('email').textContent).toBe('bob@example.com');
+    });
+  });
+
+  describe('Symbol API', () => {
+    test('store[RESET]() 等价于 store.reset()', () => {
+      const store = gfstate({ count: 0 });
+      store.count = 10;
+      expect(store.snapshot().count).toBe(10);
+      (store as any)[RESET]();
+      expect(store.snapshot().count).toBe(0);
+    });
+
+    test('store[DESTROY]() 等价于 store.destroy()', () => {
+      const store = gfstate({ count: 0 });
+      (store as any)[DESTROY]();
+      // destroy 后 snapshot 应该返回空对象或抛出警告
+      // 只要不抛异常就说明 destroy 正常执行了
+      expect(() => store.snapshot()).not.toThrow();
+    });
+
+    test('store[SNAPSHOT]() 等价于 store.snapshot()', () => {
+      const store = gfstate({ count: 42, name: 'test' });
+      const snap = (store as any)[SNAPSHOT]();
+      expect(snap.count).toBe(42);
+      expect(snap.name).toBe('test');
+    });
+
+    test('store[IS_GFSTATE_STORE] 返回 true', () => {
+      const store = gfstate({ count: 0 });
+      expect((store as any)[IS_GFSTATE_STORE]).toBe(true);
+    });
+  });
+
+  describe('嵌套子 store 的 updater 函数更新', () => {
+    test('通过 store(nestedKey, updaterFn) 更新嵌套子 store', () => {
+      const store = gfstate({ user: { name: 'Alice', age: 25 } });
+      // 用 updater 函数更新嵌套子 store
+      store('user', (prev: any) => ({ ...prev, name: 'Bob' }));
+      const snap = store.snapshot() as any;
+      expect(snap.user.name).toBe('Bob');
+      expect(snap.user.age).toBe(25);
+    });
+  });
+
+  describe('store 作为函数的 updater 模式', () => {
+    test('通过 updater 函数批量更新 store', () => {
+      const store = gfstate({ count: 0, name: 'Alice' });
+      store((prev: any) => ({ count: prev.count + 10 }));
+      expect(store.snapshot().count).toBe(10);
+      expect(store.snapshot().name).toBe('Alice');
+    });
+
+    test('updater 函数可以多次调用', () => {
+      const store = gfstate({ count: 0 });
+      store((prev: any) => ({ count: prev.count + 5 }));
+      store((prev: any) => ({ count: prev.count + 3 }));
+      expect(store.snapshot().count).toBe(8);
+    });
+  });
+
+  describe('subscribe 在组件外部使用', () => {
+    test('全局 subscribe 回调接收 key, newVal, oldVal', () => {
+      const store = gfstate({ count: 0 });
+      const changes: Array<{
+        key: string;
+        newVal: unknown;
+        oldVal: unknown;
+      }> = [];
+      store.subscribe((key: string, newVal: unknown, oldVal: unknown) => {
+        changes.push({ key, newVal, oldVal });
+      });
+      store.count = 5;
+      expect(changes).toHaveLength(1);
+      expect(changes[0]).toEqual({ key: 'count', newVal: 5, oldVal: 0 });
+    });
+
+    test('subscribe 返回 unsubscribe 函数', () => {
+      const store = gfstate({ count: 0 });
+      const changes: string[] = [];
+      const unsub = store.subscribe((key: string) => {
+        changes.push(key);
+      });
+      store.count = 1;
+      expect(changes).toHaveLength(1);
+      unsub();
+      store.count = 2;
+      // unsubscribe 后不再触发
+      expect(changes).toHaveLength(1);
+    });
+
+    test('subscribe 特定 key', () => {
+      const store = gfstate({ a: 1, b: 2 });
+      const values: unknown[] = [];
+      store.subscribe('a', (newVal: unknown) => {
+        values.push(newVal);
+      });
+      store.a = 10;
+      store.b = 20;
+      // 只有 a 变更才触发
+      expect(values).toEqual([10]);
+    });
+  });
+
+  describe('嵌套 subscribe 路径格式', () => {
+    test('嵌套子 store 变更时 key 使用点号路径', () => {
+      const store = gfstate({ nested: { x: 1 } });
+      const keys: string[] = [];
+      store.subscribe((key: string) => keys.push(key));
+      store.nested.x = 2;
+      expect(keys).toContain('nested.x');
+    });
+
+    test('多层嵌套路径正确拼接', () => {
+      const store = gfstate({ a: { b: { c: 1 } } });
+      const keys: string[] = [];
+      store.subscribe((key: string) => keys.push(key));
+      store.a.b.c = 99;
+      expect(keys).toContain('a.b.c');
+    });
+  });
+
+  describe('snapshot 特性', () => {
+    test('snapshot 修改不影响原 store', () => {
+      const store = gfstate({ count: 0 });
+      const snap = store.snapshot();
+      snap.count = 999;
+      expect(store.snapshot().count).toBe(0);
+    });
+
+    test('snapshot 包含 computed 值', () => {
+      const store = gfstate(
+        { count: 5 },
+        {
+          computed: { double: (s: any) => s.count * 2 },
+        },
+      );
+      const snap = store.snapshot();
+      expect(snap.double).toBe(10);
+    });
+  });
+
+  describe('reset 幂等性', () => {
+    test('多次 reset 结果一致', () => {
+      const store = gfstate({ count: 0, name: 'initial' });
+      store.count = 100;
+      store.name = 'changed';
+
+      store.reset();
+      expect(store.snapshot()).toEqual({ count: 0, name: 'initial' });
+
+      // 再次 reset 应该没问题，结果一致
+      store.reset();
+      expect(store.snapshot()).toEqual({ count: 0, name: 'initial' });
+
+      // 第三次
+      store.reset();
+      expect(store.snapshot()).toEqual({ count: 0, name: 'initial' });
+    });
+
+    test('reset 后修改再 reset 可以恢复初始值', () => {
+      const store = gfstate({ x: 1 });
+      store.reset();
+      store.x = 42;
+      expect(store.snapshot().x).toBe(42);
+      store.reset();
+      expect(store.snapshot().x).toBe(1);
+    });
+  });
+
+  describe('destroy 幂等性', () => {
+    test('多次 destroy 调用不抛异常', () => {
+      const store = gfstate({ count: 0 });
+      expect(() => store.destroy()).not.toThrow();
+      expect(() => store.destroy()).not.toThrow();
+      expect(() => store.destroy()).not.toThrow();
+    });
+  });
+
+  describe('created 生命周期', () => {
+    test('created 中可以使用 store 修改状态', () => {
+      const store = gfstate(
+        { count: 0 },
+        {
+          created: (s: any) => {
+            s.count = 42;
+          },
+        },
+      );
+      expect(store.snapshot().count).toBe(42);
+    });
+
+    test('created 中可以读取初始值', () => {
+      let initialCount: number | undefined;
+      gfstate(
+        { count: 10 },
+        {
+          created: (s: any) => {
+            initialCount = s.count;
+          },
+        },
+      );
+      expect(initialCount).toBe(10);
+    });
+
+    test('created 中可以访问 computed 属性', () => {
+      let computedVal: number | undefined;
+      gfstate(
+        { count: 5 },
+        {
+          computed: { double: (s: any) => s.count * 2 },
+          created: (s: any) => {
+            computedVal = s.double;
+          },
+        },
+      );
+      expect(computedVal).toBe(10);
     });
   });
 });

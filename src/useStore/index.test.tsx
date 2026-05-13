@@ -835,4 +835,242 @@ describe('useStore', () => {
     const { getByText } = render(<App />);
     expect(getByText('2x2=4')).toBeInTheDocument();
   });
+
+  // ========== 补充功能测试 ==========
+
+  describe('state 嵌套对象', () => {
+    it('state 中的嵌套对象自动包装为子 store', () => {
+      const App = () => {
+        const store = useStore({
+          state: {
+            user: { name: 'Alice', age: 25 },
+          },
+        });
+        return (
+          <>
+            <p>name:{store.state.user.name}</p>
+            <p>age:{store.state.user.age}</p>
+            <button onClick={() => (store.state.user.name = 'Bob')}>
+              change name
+            </button>
+          </>
+        );
+      };
+
+      const { getByText } = render(<App />);
+      expect(getByText('name:Alice')).toBeInTheDocument();
+      expect(getByText('age:25')).toBeInTheDocument();
+
+      fireEvent.click(getByText('change name'));
+      expect(getByText('name:Bob')).toBeInTheDocument();
+      // age 保持不变
+      expect(getByText('age:25')).toBeInTheDocument();
+    });
+  });
+
+  describe('props 函数类型同步', () => {
+    it('props 中的回调函数保持最新', () => {
+      const results: number[] = [];
+
+      const Child = ({ onClick }: { onClick: () => void }) => {
+        const store = useStore({ props: { onClick } });
+        return <button onClick={store.props.onClick}>click</button>;
+      };
+
+      const Parent = () => {
+        const [val, setVal] = React.useState(1);
+        return (
+          <>
+            <Child
+              onClick={() => {
+                results.push(val);
+              }}
+            />
+            <button onClick={() => setVal(2)}>update val</button>
+          </>
+        );
+      };
+
+      const { getByText } = render(<Parent />);
+
+      // 初始时回调使用 val=1
+      fireEvent.click(getByText('click'));
+      expect(results).toEqual([1]);
+
+      // 更新父组件 val 后，回调应该使用最新的 val=2
+      fireEvent.click(getByText('update val'));
+      fireEvent.click(getByText('click'));
+      expect(results).toEqual([1, 2]);
+    });
+  });
+
+  describe('ref 修改不触发重渲染', () => {
+    it('ref 修改不触发组件重渲染', () => {
+      let renderCount = 0;
+
+      const App = () => {
+        renderCount++;
+        const store = useStore({
+          state: { count: 0 },
+          ref: { renderTracker: 0 },
+        });
+
+        return (
+          <>
+            <p>count:{store.state.count}</p>
+            <button
+              onClick={() => {
+                store.ref.renderTracker++;
+              }}
+            >
+              inc ref
+            </button>
+            <button
+              onClick={() => {
+                store.state.count++;
+              }}
+            >
+              inc state
+            </button>
+          </>
+        );
+      };
+
+      const { getByText } = render(<App />);
+      const renderAfterMount = renderCount;
+
+      // 点击 inc ref 不应增加 renderCount
+      fireEvent.click(getByText('inc ref'));
+      fireEvent.click(getByText('inc ref'));
+      fireEvent.click(getByText('inc ref'));
+      expect(renderCount).toBe(renderAfterMount);
+
+      // 点击 inc state 应增加 renderCount
+      fireEvent.click(getByText('inc state'));
+      expect(renderCount).toBeGreaterThan(renderAfterMount);
+      expect(getByText('count:1')).toBeInTheDocument();
+    });
+  });
+
+  describe('action 中获取最新 props', () => {
+    it('action 中能获取最新的 props', () => {
+      const Child = ({ value }: { value: number }) => {
+        const store = useStore({
+          state: { result: 0 },
+          props: { value },
+          action: {
+            compute() {
+              store.state.result = store.props.value * 2;
+            },
+          },
+        });
+        return (
+          <>
+            <p>result:{store.state.result}</p>
+            <button onClick={store.action.compute}>compute</button>
+          </>
+        );
+      };
+
+      const Parent = () => {
+        const [value, setValue] = React.useState(5);
+        return (
+          <>
+            <Child value={value} />
+            <button onClick={() => setValue(10)}>update value</button>
+          </>
+        );
+      };
+
+      const { getByText } = render(<Parent />);
+      expect(getByText('result:0')).toBeInTheDocument();
+
+      // 使用初始 value=5 计算
+      fireEvent.click(getByText('compute'));
+      expect(getByText('result:10')).toBeInTheDocument();
+
+      // 更新 value 为 10，再次计算
+      fireEvent.click(getByText('update value'));
+      fireEvent.click(getByText('compute'));
+      expect(getByText('result:20')).toBeInTheDocument();
+    });
+  });
+
+  describe('computed 依赖多个 state 字段', () => {
+    it('computed 依赖多个 state 字段自动重算', () => {
+      const App = () => {
+        const store = useStore({
+          state: { price: 100, quantity: 2 },
+          options: {
+            computed: {
+              total: (s: Record<string, unknown>) =>
+                (s.price as number) * (s.quantity as number),
+            },
+          },
+        });
+        return (
+          <>
+            <p>total:{(store.state as any).total}</p>
+            <button onClick={() => store.state.quantity++}>inc qty</button>
+            <button onClick={() => (store.state.price = 200)}>
+              set price 200
+            </button>
+          </>
+        );
+      };
+
+      const { getByText } = render(<App />);
+      expect(getByText('total:200')).toBeInTheDocument();
+
+      fireEvent.click(getByText('inc qty'));
+      expect(getByText('total:300')).toBeInTheDocument();
+
+      fireEvent.click(getByText('set price 200'));
+      expect(getByText('total:600')).toBeInTheDocument();
+    });
+  });
+
+  describe('组件卸载安全性', () => {
+    it('组件卸载后 store 的变更不会导致错误', () => {
+      let storeRef: any;
+      const App = () => {
+        const store = useStore({ state: { count: 0 } });
+        storeRef = store;
+        return <div>{store.state.count}</div>;
+      };
+      const { unmount } = render(<App />);
+      unmount();
+
+      // 卸载后修改 store 不应报错
+      expect(() => {
+        storeRef.state.count = 99;
+      }).not.toThrow();
+    });
+  });
+
+  describe('state 批量更新', () => {
+    it('state 支持批量更新', () => {
+      const App = () => {
+        const store = useStore({
+          state: { a: 1, b: 2, c: 3 },
+        });
+        return (
+          <>
+            <p>
+              a:{store.state.a} b:{store.state.b} c:{store.state.c}
+            </p>
+            <button onClick={() => store.state({ a: 10, b: 20 })}>
+              batch
+            </button>
+          </>
+        );
+      };
+
+      const { getByText } = render(<App />);
+      expect(getByText('a:1 b:2 c:3')).toBeInTheDocument();
+
+      fireEvent.click(getByText('batch'));
+      expect(getByText('a:10 b:20 c:3')).toBeInTheDocument();
+    });
+  });
 });
